@@ -97,8 +97,8 @@ function log(entry: Record<string, unknown>) {
 
 // ---- output parsing (the CC mod's Cr()) ----
 type Tag = "You should know" | "Heads up";
-type Note = { line: string; tag: Tag; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean };
-type Parsed = { kind: "none" } | { kind: "parse_failed" } | { kind: "line"; line: string; tag: Tag; explanation?: string };
+type Note = { line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean };
+type Parsed = { kind: "none" } | { kind: "parse_failed" } | { kind: "line"; line: string; tag: Tag; evidence?: string; explanation?: string };
 const strip = (s: string) => s.replace(/^[\s>*_`"'\u201C\u201D\u2018\u2019-]+/, "");
 function parse(text: string): Parsed {
 	const lines = text.split("\n");
@@ -109,12 +109,15 @@ function parse(text: string): Parsed {
 	const ti = lines.findIndex((l, i) => i > li && /^tag\s*:/i.test(strip(l)));
 	const tag: Tag = ti !== -1 && /heads[\s-]*up/i.test(lines[ti]) ? "Heads up" : "You should know";
 	const ei = lines.findIndex((l, i) => i > li && /^explain\s*:/i.test(strip(l)));
+	const vi = lines.findIndex((l, i) => i > li && (ei === -1 || i < ei) && /^evidence\s*:/i.test(strip(l)));
+	const ev = vi === -1 ? "" : strip(lines[vi]).replace(/^evidence\s*:\s*/i, "").trim();
+	const evidence = ev && !/^none\.?$/i.test(ev) ? ev : undefined;
 	let explanation: string | undefined;
 	if (ei !== -1) {
 		const first = strip(lines[ei]).replace(/^explain\s*:\s*/i, "");
 		explanation = [first, ...lines.slice(ei + 1)].join("\n").trim() || undefined;
 	}
-	return { kind: "line", line, tag, explanation };
+	return { kind: "line", line, tag, evidence, explanation };
 }
 const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
 
@@ -200,48 +203,78 @@ export default function (pi: ExtensionAPI) {
 	 * check on Opus 5.5 (155 checks, $56.76 in checks.jsonl before this fix).
 	 */
 	let mainPayload: Record<string, unknown> | undefined;
+	const forkPayloads = new WeakSet<object>();
 	pi.on("before_provider_request", (e) => {
-		if (e.payload && typeof e.payload === "object") mainPayload = e.payload as Record<string, unknown>;
+		const p = e.payload;
+		if (!p || typeof p !== "object" || forkPayloads.has(p as object)) return; // never align to our own fork
+		mainPayload = p as Record<string, unknown>;
 	});
 
-	/** Send the fork as the main request with only its message list swapped in. */
-	const alignWithMain = (forked: unknown): unknown => {
-		const main = mainPayload;
-		if (!main || !forked || typeof forked !== "object") return undefined;
-		const f = forked as Record<string, unknown>;
-		if (main["model"] !== f["model"]) return undefined; // a different model has its own cache
-		const key = Array.isArray(f["messages"]) ? "messages" : Array.isArray(f["input"]) ? "input" : undefined;
-		if (!key || !Array.isArray(main[key])) return undefined;
-		return { ...main, [key]: key === "messages" ? markBeforePrompt(f[key] as any[]) : f[key] };
-	};
+	/** How the last fork lined up with the main request; logged with each check. */
+	let lastAlign: Record<string, unknown> = {};
 
 	/**
-	 * Claude Code's model.fork passes skipCacheWrite, which moves the message
-	 * cache marker from the fork's own prompt back to the message before it
-	 * (IWt in the 2.1.288 binary: `Se=ke(e.length-1); if(r) Se=ke(Se-1)`).
-	 * The fork then reads the shared prefix without paying to cache its ~8k
-	 * token detect prompt, which no later request will ever reuse.
+	 * Cache fix, take two. The first version rebuilt the fork's messages and moved
+	 * the cache marker to the message before the detect prompt. Anthropic only finds
+	 * a cached prefix by looking back about 20 content blocks from a marker, and
+	 * most checks landed outside that window: checks.jsonl showed ~21k tokens read
+	 * (tools + system only) and 130-300k written, about $1 per check.
+	 *
+	 * Now the fork reuses the main request's message list byte for byte, including
+	 * its cache marker, so the fork reads exactly what the main request cached. The
+	 * messages after it (the turn that just ended) and the detect prompt carry no
+	 * marker: they are paid once as plain input and never written to the cache.
 	 */
-	const markBeforePrompt = (messages: any[]): any[] => {
-		const markable = (b: any) => b && typeof b === "object" && b.type !== "thinking" && b.type !== "redacted_thinking";
-		const unmark = (m: any) =>
-			Array.isArray(m?.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }: any) => b) } : m;
-		if (messages.length < 2) return messages;
-		const out = messages.map((m, i) => (i === messages.length - 1 ? unmark(m) : m));
-		for (let i = out.length - 2; i >= 0; i--) {
-			const content = out[i]?.content;
-			if (!Array.isArray(content)) continue;
-			const at = content.findLastIndex(markable);
-			if (at < 0) continue;
-			const blocks = content.slice();
-			blocks[at] = { ...blocks[at], cache_control: { type: "ephemeral" } };
-			out[i] = { ...out[i], content: blocks };
-			break;
+	const alignWithMain = (forked: unknown): unknown => {
+		const main = mainPayload;
+		lastAlign = { aligned: false };
+		if (!main || !forked || typeof forked !== "object") return markFork(undefined, (lastAlign.why = "no main payload"));
+		const f = forked as Record<string, unknown>;
+		if (main["model"] !== f["model"]) return markFork(undefined, (lastAlign.why = "model differs"));
+		const key = Array.isArray(f["messages"]) ? "messages" : Array.isArray(f["input"]) ? "input" : undefined;
+		if (!key || !Array.isArray(main[key])) return markFork(undefined, (lastAlign.why = "no message list"));
+		if (key === "input") return markFork({ ...main, input: f["input"] }, undefined, true);
+		const mainMsgs = main[key] as any[];
+		const forkMsgs = (f[key] as any[]).map(unmark);
+		const same = commonPrefix(mainMsgs, forkMsgs);
+		lastAlign = { aligned: true, mainLen: mainMsgs.length, forkLen: forkMsgs.length, common: same };
+		if (same === 0) return markFork({ ...main, messages: forkMsgs }, undefined, true);
+		const head = mainMsgs.slice(0, same);
+		if (same < mainMsgs.length) {
+			// Main's marker fell outside the match: put the same marker on the last
+			// matching message so Anthropic can still look back to main's cache.
+			const marker = findMarker(mainMsgs) ?? { type: "ephemeral" };
+			const last = unmark(head[same - 1]);
+			if (Array.isArray(last?.content) && last.content.length > 0) {
+				const blocks = last.content.slice();
+				const at = blocks.findLastIndex((b: any) => b?.type !== "thinking" && b?.type !== "redacted_thinking");
+				if (at >= 0) blocks[at] = { ...blocks[at], cache_control: marker };
+				head[same - 1] = { ...last, content: blocks };
+			}
 		}
-		return out;
+		// Main's own messages (marker included), then the new tail, unmarked.
+		return markFork({ ...main, messages: [...head, ...forkMsgs.slice(same)] }, undefined, true);
+	};
+	const markFork = (payload: Record<string, unknown> | undefined, _why?: string, _aligned?: boolean) => {
+		if (payload) forkPayloads.add(payload);
+		return payload;
+	};
+	const unmark = (m: any) =>
+		Array.isArray(m?.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }: any) => b) } : m;
+	const sameMsg = (a: any, b: any) => JSON.stringify(unmark(a)) === JSON.stringify(unmark(b));
+	const findMarker = (msgs: any[]) => {
+		for (let i = msgs.length - 1; i >= 0; i--)
+			for (const b of Array.isArray(msgs[i]?.content) ? msgs[i].content : []) if (b?.cache_control) return b.cache_control;
+		return undefined;
+	};
+	/** How many leading messages are identical once cache markers are ignored. */
+	const commonPrefix = (main: any[], fork: any[]) => {
+		let i = 0;
+		while (i < main.length && i < fork.length && sameMsg(main[i], fork[i])) i++;
+		return i;
 	};
 
-	function relayToParent(n: { line: string; tag: Tag; explanation?: string; from: string }) {
+	function relayToParent(n: { line: string; tag: Tag; evidence?: string; explanation?: string; from: string }) {
 		try {
 			mkdirSync(CHILD_INBOX!, { recursive: true });
 			const base = join(CHILD_INBOX!, `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
@@ -268,7 +301,7 @@ export default function (pi: ExtensionAPI) {
 				// Feed it to the parent agent as a message. Busy: steer into the current run.
 				// Idle: queue for the next turn rather than waking the agent on its own.
 				const tag = n.tag === "Heads up" ? "Heads up" : "You should know";
-				const body = [`${tag} \u00b7 ${n.line}`, ...(n.explanation ? ["", n.explanation] : [])]
+				const body = [`${tag} \u00b7 ${n.line}`, ...(n.evidence ? [`Evidence: ${n.evidence}`] : []), ...(n.explanation ? ["", n.explanation] : [])]
 					.join("\n").split("\n").map((l: string) => (l === "" ? ">" : `> ${l}`)).join("\n");
 				const idle = ctx.isIdle();
 				pi.sendMessage(
@@ -371,11 +404,11 @@ export default function (pi: ExtensionAPI) {
 									explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
 								} catch {}
 							}
-							relayToParent({ line: p.line, tag: p.tag, explanation, from: CHILD_NAME });
+							relayToParent({ line: p.line, tag: p.tag, evidence: p.evidence, explanation, from: CHILD_NAME });
 							outcome = "relayed";
 							return;
 						}
-						notes.push({ line: p.line, tag: p.tag, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 });
+						notes.push({ line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 });
 						while (notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
 						render(ctx);
 					}
@@ -385,7 +418,7 @@ export default function (pi: ExtensionAPI) {
 				extra.error = String(err);
 			} finally {
 				if (inFlight === ac) inFlight = undefined;
-				log({ event: "check", step, outcome, ms: Date.now() - t0, ...extra });
+				log({ event: "check", step, outcome, ms: Date.now() - t0, align: lastAlign, ...extra });
 				if (DEBUG) ctx.ui.notify(`you-should-know: step ${step} \u2192 ${outcome} (${Date.now() - t0}ms)`, "info");
 			}
 		})();
@@ -441,7 +474,7 @@ export default function (pi: ExtensionAPI) {
 
 	// CC's un(): quote the note into the main session.
 	function chatInMain(n: Note, explanation?: string) {
-		const body = [`${n.tag}${n.from ? ` (from subagent ${n.from})` : ""} \u00b7 ${n.line}`, ...(explanation ? ["", explanation] : [])]
+		const body = [`${n.tag}${n.from ? ` (from subagent ${n.from})` : ""} \u00b7 ${n.line}`, ...(n.evidence ? [`Evidence: ${n.evidence}`] : []), ...(explanation ? ["", explanation] : [])]
 			.join("\n")
 			.split("\n")
 			.map((l) => (l === "" ? ">" : `> ${l}`))

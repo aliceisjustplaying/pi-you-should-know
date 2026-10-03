@@ -47,6 +47,7 @@ or
 
 learn: <short statement of something to know and learn more about>  
 tag: <You should know or Heads up>  
+evidence: <where this shows in the work: file:line, test name, command, or tool call, separated by "; ">  
 explain:  
 **<short, readable title in bold>**  
 <plain-English, highly digestible and accessible explainer text>
@@ -157,6 +158,7 @@ IF you do have a topic to suggest, reply with each of these labels, each on newl
 * "learn:" followed by your suggestion, context, and why it’s important.   
   * The options “Learn more” or “Dismiss” should naturally follow.  
 * “tag”: You should know or Heads up. This is shown when presenting the suggestion.  
+* “evidence:” one line of receipts someone can check in seconds: `path/to/file.rs:197`, a test name, the command that ran, or the tool call that showed it, separated by "; ". Only cite what actually appears in the conversation; never guess a line number. If there is truly nothing to cite, write “evidence: none”.  
 * “explain:” with a plain-english explanation for someone with no context (note: the user will have the opportunity to drill in further)
 
 ### learn: examples
