@@ -1,0 +1,23 @@
+{
+  "name": "pi-you-should-know",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi extension: a port of Claude Code's you-should-know mod; every few steps, ask a fork of the conversation whether there is something you should know but probably missed",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "UNLICENSED",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aliceisjustplaying/pi-you-should-know.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/you-should-know/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
