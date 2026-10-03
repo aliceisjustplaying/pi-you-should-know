@@ -26,7 +26,3 @@ Each check reuses the conversation the main agent already cached, so it costs a 
 ## Install
 
     pi install git:github.com/aliceisjustplaying/pi-you-should-know
-
-## Keep this repo private
-
-`detect-prompt.md` and some settings are copied from Claude Code, which belongs to Anthropic. This code isn't licensed for anyone else to use.
