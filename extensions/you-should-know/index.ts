@@ -259,20 +259,30 @@ export default function (pi: ExtensionAPI) {
 	function drainInbox(ctx: ExtensionContext) {
 		const dir = inboxDir(ctx);
 		if (!existsSync(dir)) return;
-		let added = false;
 		for (const f of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
 			const path = join(dir, f);
 			try {
 				const n = JSON.parse(readFileSync(path, "utf8"));
 				unlinkSync(path);
 				if (!n?.line || !state.enabled) continue;
-				notes.push({ line: n.line, tag: n.tag === "Heads up" ? "Heads up" : "You should know", explanation: n.explanation, from: n.from, shownAt: Date.now(), promptsSurvived: 0 });
-				while (notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
-				log({ event: "relayed_in", from: n.from, line: n.line });
-				added = true;
+				// Feed it to the parent agent as a message. Busy: steer into the current run.
+				// Idle: queue for the next turn rather than waking the agent on its own.
+				const tag = n.tag === "Heads up" ? "Heads up" : "You should know";
+				const body = [`${tag} \u00b7 ${n.line}`, ...(n.explanation ? ["", n.explanation] : [])]
+					.join("\n").split("\n").map((l: string) => (l === "" ? ">" : `> ${l}`)).join("\n");
+				const idle = ctx.isIdle();
+				pi.sendMessage(
+					{
+						customType: "you-should-know",
+						content: `Your subagent "${n.from ?? "subagent"}" raised a note its side agent thinks you (and the user) should know. It's about the subagent's work; you can't see its conversation. Weigh it and act or mention it if it matters:\n${body}`,
+						display: true,
+						details: n,
+					},
+					idle ? { deliverAs: "nextTurn" } : { deliverAs: "steer" },
+				);
+				log({ event: "relayed_in", from: n.from, line: n.line, deliverAs: idle ? "nextTurn" : "steer" });
 			} catch {}
 		}
-		if (added) render(ctx);
 	}
 
 	pi.on("session_start", (_e, ctx) => {
