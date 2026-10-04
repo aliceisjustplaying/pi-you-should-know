@@ -15,6 +15,10 @@ It's a port of the "you should know" plugin built into Claude Code.
 
 If you keep ignoring notes, it checks less often. Answering any note resets that.
 
+## In RPC clients
+
+Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. A note found after a run has finished is sent at the start of the next run. `/ysk` still works there through the client's dialogs.
+
 ## With herdr subagents
 
 When the extension runs inside a [pi-herdr-subagents](https://github.com/aliceisjustplaying/pi-herdr-subagents) subagent, its notes aren't shown in the subagent's pane. They're passed to the parent agent as a message instead, labeled with the subagent's name, so the agent that's coordinating the work can act on them.

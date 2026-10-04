@@ -6,6 +6,10 @@
 // `learn: none`. When it isn't, show a note above the editor. Respond with /ysk (or alt+shift+y).
 //
 // Reference (extracted from the Claude Code binary): ~/.pi/agent/reference/you-should-know/
+//
+// Outside the terminal UI (RPC clients such as T3 Code) there is no widget or custom component.
+// Each note is sent once as a notify, `[ysk:<id>] <tag> · <line> (<evidence>)` followed by its
+// explanation, for the client to show and answer itself; /ysk still works through select dialogs.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
@@ -97,7 +101,7 @@ function log(entry: Record<string, unknown>) {
 
 // ---- output parsing (the CC mod's Cr()) ----
 type Tag = "You should know" | "Heads up";
-type Note = { line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean };
+type Note = { id: string; line: string; tag: Tag; evidence?: string; explanation?: string; from?: string; shownAt: number; promptsSurvived: number; countedIgnored?: boolean };
 type Parsed = { kind: "none" } | { kind: "parse_failed" } | { kind: "line"; line: string; tag: Tag; evidence?: string; explanation?: string };
 const strip = (s: string) => s.replace(/^[\s>*_`"'\u201C\u201D\u2018\u2019-]+/, "");
 function parse(text: string): Parsed {
@@ -133,6 +137,7 @@ const textOf = (msg: { content: unknown }) =>
 export default function (pi: ExtensionAPI) {
 	let state = loadState();
 	let notes: Note[] = []; // oldest first; notes[0] is the one /ysk and alt+x act on
+	let unannounced: Note[] = []; // RPC mode: notes waiting for a run to show up in
 	let inFlight: AbortController | undefined;
 	let promptCounter = 0; // stands in for CC's turnId staleness check
 	let checks = 0;
@@ -148,7 +153,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const render = (ctx: ExtensionContext) => {
-		if (!ctx.hasUI) return;
+		if (ctx.mode !== "tui") return;
 		if (notes.length === 0) {
 			ctx.ui.setWidget(WIDGET, undefined);
 			return;
@@ -321,6 +326,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_e, ctx) => {
 		state = loadState();
 		notes = [];
+		unannounced = [];
 		promptCounter = 0;
 		render(ctx);
 		if (inboxTimer) clearInterval(inboxTimer);
@@ -338,10 +344,25 @@ export default function (pi: ExtensionAPI) {
 		inboxTimer = undefined;
 	});
 
+	// RPC clients only show a notify while a run is going (T3 Code drops one between turns),
+	// so a note found after the run settled waits for the next one.
+	const noteText = (n: Note) =>
+		`[ysk:${n.id}] ${n.tag} \u00b7 ${n.line}${n.evidence ? ` (${n.evidence})` : ""}` +
+		(n.explanation ? `\n\n${n.explanation}` : "");
+	function announce(ctx: ExtensionContext, n: Note) {
+		if (ctx.isIdle()) unannounced.push(n);
+		else ctx.ui.notify(noteText(n), "info");
+	}
+	pi.on("agent_start", (_e, ctx) => {
+		if (ctx.mode === "tui") return;
+		for (const n of unannounced.splice(0)) if (notes.includes(n)) ctx.ui.notify(noteText(n), "info");
+	});
+
 	// A note that survives PROMPTS_SURVIVED user prompts unanswered counts as ignored (for backoff),
 	// but stays on screen so notes can pile up until you answer or dismiss them.
-	pi.on("input", (e) => {
-		if (e.source === "extension") return;
+	// RPC clients answer notes themselves without telling us, so nothing counts as ignored there.
+	pi.on("input", (e, ctx) => {
+		if (e.source === "extension" || ctx.mode !== "tui") return;
 		promptCounter++;
 		let changed = false;
 		for (const n of notes) {
@@ -408,9 +429,17 @@ export default function (pi: ExtensionAPI) {
 							outcome = "relayed";
 							return;
 						}
-						notes.push({ line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 });
+						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 };
+						if (ctx.mode !== "tui" && !note.explanation) {
+							// The client's "Explain" has nothing to ask, so write the explanation now.
+							try {
+								note.explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
+							} catch {}
+						}
+						notes.push(note);
 						while (notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
 						render(ctx);
+						if (ctx.mode !== "tui") announce(ctx, note);
 					}
 				}
 			} catch (err) {
@@ -431,7 +460,7 @@ export default function (pi: ExtensionAPI) {
 			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
 		}
 		while (true) {
-			const choice = await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
+			const choice = ctx.mode !== "tui" ? await explainBySelect(ctx, n, text!) : await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
 				const c = new Container();
 				const border = new DynamicBorder((s: string) => theme.fg("accent", s));
 				c.addChild(border);
@@ -470,6 +499,14 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "chat") chatInMain(n, text);
 			return;
 		}
+	}
+
+	// Outside the terminal UI: the explanation as a notice, then the same choices as a select.
+	const EXPLAIN_OPTIONS = { Understood: "understood", "Chat in main session": "chat", "Simpler words": "simpler_words", "Less detail": "less_detail", "More detail": "more_detail" } as const;
+	async function explainBySelect(ctx: ExtensionContext, n: Note, text: string) {
+		ctx.ui.notify(`${n.tag} \u00b7 ${n.line}\n\n${text}`, "info");
+		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, Object.keys(EXPLAIN_OPTIONS));
+		return pick ? EXPLAIN_OPTIONS[pick as keyof typeof EXPLAIN_OPTIONS] : "dismiss";
 	}
 
 	// CC's un(): quote the note into the main session.
