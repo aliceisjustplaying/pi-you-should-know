@@ -546,6 +546,11 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Nothing to know right now. (${state.enabled ? `${checks} checks so far` : "off: /ysk on"})`, "info");
 			return;
 		}
+		// RPC clients (T3) show and answer notes in their own UI; a second menu here only duplicates it.
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify("Answer notes where your client shows them.", "info");
+			return;
+		}
 		const n = notes[0];
 		const options = ["1 Learn more", "2 Knew this already", "3 Chat in main session", "0 Dismiss"];
 		const pick = await ctx.ui.select(`${n.tag} \u00b7 ${n.line}`, options);
