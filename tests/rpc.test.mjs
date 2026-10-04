@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, watch } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,7 +23,7 @@ function fixture() {
       });
       const exited = once(child, 'exit');
       let buffer = '', stderr = '', sequence = 0;
-      const events = [], pending = new Map();
+      const events = [], pending = new Map(), waiters = new Set();
       child.stderr.on('data', (data) => { stderr += data; });
       child.stdout.on('data', (data) => {
         buffer += data;
@@ -32,6 +32,7 @@ function fixture() {
           const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
           let event; try { event = JSON.parse(line); } catch { continue; }
           events.push(event);
+          for (const waiter of waiters) if (waiter.predicate(event)) { waiters.delete(waiter); waiter.resolve(event); }
           if (event.type === 'response') pending.get(event.id)?.(event);
         }
       });
@@ -48,6 +49,11 @@ function fixture() {
       };
       const client = {
         events, send,
+        waitFor(predicate) {
+          const found = events.find(predicate);
+          if (found) return Promise.resolve(found);
+          return new Promise((resolve, reject) => { waiters.add({predicate, resolve}); child.once("error", reject); child.once("exit", () => reject(new Error("Pi exited before the expected event"))); });
+        },
         command: (message) => send({ type: 'prompt', message }),
         async close() { child.kill('SIGTERM'); await exited; children.delete(client); },
       };
@@ -95,17 +101,10 @@ test('a stale Pi process cannot erase another session’s Knew or resurrect its 
 });
 
 test('an idle parent persists a relayed note before its next turn and keeps it after restart', async () => {
-  const f = fixture(); let watcher;
+  const f = fixture();
   try {
     let parent = await f.open();
-    const logDir = join(f.agentDir, 'you-should-know');
-    mkdirSync(logDir, { recursive: true });
-    const logFile = join(logDir, 'checks.jsonl'); writeFileSync(logFile, '');
-    const delivered = new Promise((resolve) => {
-      watcher = watch(logDir, () => {
-        if (readFileSync(logFile, 'utf8').includes('"event":"relayed_in"')) resolve();
-      });
-    });
+    const delivered = parent.waitFor(event => event.type === "message_end" && event.message?.customType === "you-should-know");
     const inbox = join(f.root, 'artifacts', parent.session.sessionId, 'you-should-know-inbox');
     mkdirSync(inbox, { recursive: true });
     writeFileSync(join(inbox, 'child-note.json'), JSON.stringify({ line: 'The child found a migration problem.', tag: 'Heads up', from: 'child' }));
@@ -114,5 +113,5 @@ test('an idle parent persists a relayed note before its next turn and keeps it a
     const { messages } = await parent.send({ type: 'get_messages' });
     assert.equal(messages.filter((message) => message.role === 'custom' && message.customType === 'you-should-know' && message.content.includes('migration problem')).length, 1);
     assert.equal(parent.events.filter((event) => event.type === 'agent_start').length, 0);
-  } finally { watcher?.close(); await f.close(); }
+  } finally { await f.close(); }
 });

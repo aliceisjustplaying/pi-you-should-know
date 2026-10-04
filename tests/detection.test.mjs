@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync, watch } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +20,7 @@ for (const layout of ['parent', 'flat-child', 'nested-child']) {
     writeFileSync(logFile, '');
     const receipt = join(root, 'receipt.txt');
     writeFileSync(receipt, 'local fixture');
-    let child, watcher, settled = false, finishDetection;
+    let child, settled = false, finishDetection;
     let requests = 0, sideRequests = 0, stderr = '';
     const events = [];
     const server = createServer(async (request, response) => {
@@ -49,16 +49,11 @@ for (const layout of ['parent', 'flat-child', 'nested-child']) {
       const port = server.address().port;
       writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: { localfixture: { baseUrl: `http://127.0.0.1:${port}/v1`, api: 'openai-completions', apiKey: 'local-only', models: [{ id: 'fixture', contextWindow: 128000, maxTokens: 1024 }] } } }));
       const activity = join(root, 'parent-artifacts', layout === 'nested-child' ? 'subagent-activity/child.json' : 'subagent-activity-child.json');
-      const environment = { ...process.env, PI_CODING_AGENT_DIR: agentDir };
+      const environment = { ...process.env, PI_CODING_AGENT_DIR: agentDir, YSK_DEBUG: "1" };
       if (layout !== 'parent') { environment.PI_SUBAGENT_ACTIVITY_FILE = activity; environment.PI_SUBAGENT_NAME = 'fixture-child'; }
       else { delete environment.PI_SUBAGENT_ACTIVITY_FILE; delete environment.PI_SUBAGENT_NAME; }
       const checked = new Promise((resolve, reject) => {
-        watcher = watch(logDir, () => {
-          const entries = readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-          const check = entries.find((entry) => entry.event === 'check');
-          if (check) resolve(check);
-        });
-        child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-extensions', '-e', (process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url))), '--provider', 'localfixture', '--model', 'fixture', '--thinking', 'off', '--session', join(root, 'session.jsonl')], {
+        child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-skills', '--no-context-files', '--no-extensions', '-e', (process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url))), '--provider', 'localfixture', '--model', 'fixture', '--thinking', 'off', '--session', join(root, 'session.jsonl')], {
           cwd: root, env: environment, stdio: ['pipe', 'pipe', 'pipe'], signal: AbortSignal.timeout(18_000),
         });
         child.on('error', reject);
@@ -71,6 +66,10 @@ for (const layout of ['parent', 'flat-child', 'nested-child']) {
             const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
             let event; try { event = JSON.parse(line); } catch { continue; }
             events.push(event);
+            if (event.method === "notify" && event.message?.startsWith("you-should-know: step 6 ")) {
+              const check = readFileSync(logFile, "utf8").trim().split("\n").map(line => JSON.parse(line)).find(entry => entry.event === "check");
+              resolve(check);
+            }
             if (event.type === 'extension_error') reject(new Error(JSON.stringify(event)));
             if (event.type === 'agent_settled') { settled = true; finishDetection?.(); }
             if (event.type === 'response' && event.success === false) reject(new Error(JSON.stringify(event)));
@@ -96,7 +95,6 @@ for (const layout of ['parent', 'flat-child', 'nested-child']) {
         assert.equal(note.line, 'The fixture proves idle delivery.');
       }
     } finally {
-      watcher?.close();
       if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited; }
       server.closeAllConnections(); await new Promise((resolve) => server.close(resolve));
       rmSync(root, { recursive: true, force: true });
