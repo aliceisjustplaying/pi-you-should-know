@@ -15,14 +15,14 @@ registerHooks({ resolve(specifier, context, next) {
   return next(specifier, context);
 }});
 const { default: extension } = await import(process.env.YSK_TEST_SOURCE ?? '../extensions/you-should-know/index.ts');
-function open(session) {
+function open(session, sessionDir = home) {
   const handlers = new Map();
   const notices = [];
   let command;
   extension({ on: (event, handler) => handlers.set(event, handler), registerCommand: (_, value) => { command = value.handler; }, registerShortcut() {} });
   const ctx = {
     mode: 'rpc', hasUI: false, isIdle: () => false,
-    sessionManager: { getSessionDir: () => home, getSessionId: () => session },
+    sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => session },
     ui: { notify: (message) => notices.push(message) },
   };
   handlers.get('session_start')({}, ctx);
@@ -56,4 +56,15 @@ test('RPC prompts count ignored notes and back off, but ysk commands do not', as
     assert.equal(readFileSync(file, 'utf8'), before);
     assert.equal(existsSync(file + '.tmp-' + process.pid), false);
   } finally { fs.renameSync = rename; syncBuiltinESMExports(); client.close(); }
+});
+
+test('temporary Pi discovery sessions do not create artifacts in the working directory', async () => {
+  const cwd = process.cwd();
+  process.chdir(home);
+  try {
+    const client = open('temporary-discovery', '');
+    await client.command('test');
+    client.close();
+    assert.equal(existsSync(join(home, 'artifacts/temporary-discovery')), false);
+  } finally { process.chdir(cwd); }
 });

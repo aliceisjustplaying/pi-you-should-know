@@ -186,10 +186,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const notesFile = (ctx: ExtensionContext) =>
-		join(ctx.sessionManager.getSessionDir(), "artifacts", ctx.sessionManager.getSessionId(), "you-should-know.json");
+		ctx.sessionManager.getSessionDir()
+			? join(ctx.sessionManager.getSessionDir(), "artifacts", ctx.sessionManager.getSessionId(), "you-should-know.json")
+			: undefined;
 	const persistNotes = (ctx: ExtensionContext) => {
 		const file = notesFile(ctx);
-		atomicJson(file, { notes, answered: [...answered] });
+		if (file) atomicJson(file, { notes, answered: [...answered] });
 	};
 
 	const render = (ctx: ExtensionContext) => {
@@ -381,9 +383,12 @@ export default function (pi: ExtensionAPI) {
 		notes = [];
 		answered = new Map();
 		try {
-			const saved = JSON.parse(readFileSync(notesFile(ctx), "utf8"));
-			notes = saved.notes;
-			answered = new Map(saved.answered);
+			const file = notesFile(ctx);
+			if (file) {
+				const saved = JSON.parse(readFileSync(file, "utf8"));
+				notes = saved.notes;
+				answered = new Map(saved.answered);
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
