@@ -14,7 +14,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -43,7 +43,12 @@ const DEBUG = !!process.env.YSK_DEBUG;
 // the parent watches its own <sessionDir>/artifacts/<sessionId>/you-should-know-inbox/ and shows them.
 const INBOX = "you-should-know-inbox";
 const CHILD_ACTIVITY = process.env.PI_SUBAGENT_ACTIVITY_FILE?.trim();
-const CHILD_INBOX = CHILD_ACTIVITY ? join(dirname(dirname(CHILD_ACTIVITY)), INBOX) : undefined;
+// The activity file is either <artifactDir>/subagent-activity/<id>.json or, from the harness
+// driver, <artifactDir>/subagent-activity-<id>.json. Either way the inbox sits in <artifactDir>.
+const CHILD_ARTIFACT_DIR = CHILD_ACTIVITY
+	? basename(dirname(CHILD_ACTIVITY)) === "subagent-activity" ? dirname(dirname(CHILD_ACTIVITY)) : dirname(CHILD_ACTIVITY)
+	: undefined;
+const CHILD_INBOX = CHILD_ARTIFACT_DIR ? join(CHILD_ARTIFACT_DIR, INBOX) : undefined;
 const CHILD_NAME = process.env.PI_SUBAGENT_NAME?.trim() || process.env.PI_SUBAGENT_ID?.trim() || "subagent";
 
 // ---- prompts (verbatim from the CC mod) ----
