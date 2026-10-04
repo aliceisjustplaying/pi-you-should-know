@@ -527,6 +527,14 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`You should know: ${state.enabled ? "on" : "off"}`, "info");
 			return;
 		}
+		if (arg === "test") {
+			// A sample note, shown at once, to check the display path without waiting for a real one.
+			const note: Note = { id: "test" + Date.now().toString(36), line: "This is a test note from /ysk test.", tag: "Heads up", evidence: "/ysk test", explanation: "Nothing is wrong. This note only checks that notes reach your screen.", shownAt: Date.now(), promptsSurvived: 0 };
+			notes.push(note);
+			render(ctx);
+			if (ctx.mode !== "tui") ctx.ui.notify(noteText(note), "info");
+			return;
+		}
 		if (arg === "status") {
 			ctx.ui.notify(
 				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${pickModel(ctx)?.id ?? "?"} \u00b7 log ${LOG_FILE}`,
@@ -568,7 +576,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("ysk", {
-		description: "You should know: respond to the current note (/ysk on|off|status)",
+		description: "You should know: respond to the current note (/ysk on|off|status|test)",
 		handler: async (args, ctx) => respond(ctx, args?.trim() || undefined),
 	});
 	pi.registerShortcut("alt+shift+y", { description: "You should know: respond to the current note", handler: (ctx) => respond(ctx) });
