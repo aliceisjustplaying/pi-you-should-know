@@ -12,7 +12,7 @@
 // explanation, for the client to show and answer itself. The client reports each answer back
 // with `/ysk answer <id> <action>`.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,8 +32,10 @@ const backoff = (ignoredInARow: number) =>
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DETECT_TEMPLATE = readFileSync(join(HERE, "detect-prompt.md"), "utf8");
-const STATE_FILE = join(homedir(), ".pi", "agent", "you-should-know", "state.json");
-const LOG_FILE = join(homedir(), ".pi", "agent", "you-should-know", "checks.jsonl");
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+const STATE_FILE = join(AGENT_DIR, "you-should-know", "state.json");
+const KNOWLEDGE_FILE = join(AGENT_DIR, "you-should-know", "knowledge.jsonl");
+const LOG_FILE = join(AGENT_DIR, "you-should-know", "checks.jsonl");
 const WIDGET = "you-should-know";
 const DEBUG = !!process.env.YSK_DEBUG;
 
@@ -85,18 +87,38 @@ const explainPrompt = (line: string, prev?: { direction: Exclude<Direction, "fir
 
 // ---- persistent state (across sessions, like CC's plugin store) ----
 type State = { enabled: boolean; seen: string[]; known: string[]; ignoredInARow: number; skip: number };
-function loadState(): State {
-	const d: State = { enabled: true, seen: [], known: [], ignoredInARow: 0, skip: 0 };
+// Each feedback write is one append, so another Pi process cannot overwrite it
+// with an older in-memory snapshot. state.json remains the readable snapshot.
+function readKnowledge(legacy: string[]): string[] {
+	const known = new Map(legacy.map((line) => [norm(line), line]));
+	if (existsSync(KNOWLEDGE_FILE)) for (const line of readFileSync(KNOWLEDGE_FILE, "utf8").split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const entry = JSON.parse(line);
+			if (typeof entry.line !== "string" || typeof entry.known !== "boolean") continue;
+			if (entry.known) known.set(norm(entry.line), entry.line);
+			else known.delete(norm(entry.line));
+		} catch { /* An interrupted final append is ignored. The next starts on a new line. */ }
+	}
+	return [...known.values()].slice(-HISTORY_MAX);
+}
+function atomicJson(file: string, value: unknown) {
+	mkdirSync(dirname(file), { recursive: true });
+	const temporary = file + ".tmp-" + process.pid;
 	try {
-		if (existsSync(STATE_FILE)) return { ...d, ...JSON.parse(readFileSync(STATE_FILE, "utf8")) };
-	} catch {}
-	return d;
+		writeFileSync(temporary, JSON.stringify(value, null, 2));
+		renameSync(temporary, file);
+	} finally { rmSync(temporary, { force: true }); }
+}
+function loadState(): State {
+	let state: State = { enabled: true, seen: [], known: [], ignoredInARow: 0, skip: 0 };
+	if (existsSync(STATE_FILE)) state = { ...state, ...JSON.parse(readFileSync(STATE_FILE, "utf8")) };
+	state.known = readKnowledge(state.known);
+	return state;
 }
 function saveState(s: State) {
-	try {
-		mkdirSync(dirname(STATE_FILE), { recursive: true });
-		writeFileSync(STATE_FILE, JSON.stringify(s, null, 2));
-	} catch {}
+	s.known = readKnowledge(s.known);
+	atomicJson(STATE_FILE, s);
 }
 function log(entry: Record<string, unknown>) {
 	try {
@@ -143,10 +165,15 @@ const textOf = (msg: { content: unknown }) =>
 export default function (pi: ExtensionAPI) {
 	let state = loadState();
 	let notes: Note[] = []; // oldest first; notes[0] is the one /ysk and alt+x act on
-	let unannounced: Note[] = []; // RPC mode: notes waiting for a run to show up in
+	let answered = new Map<string, { note: Note; action: string }>();
 	let inFlight: AbortController | undefined;
 	let promptCounter = 0; // stands in for CC's turnId staleness check
 	let checks = 0;
+	const remember = (line: string, known: boolean) => {
+		mkdirSync(dirname(KNOWLEDGE_FILE), { recursive: true });
+		appendFileSync(KNOWLEDGE_FILE, "\n" + JSON.stringify({ line, known }) + "\n");
+		state.known = readKnowledge(state.known);
+	};
 
 	const pickModel = (ctx: ExtensionContext) => {
 		const o = process.env.YSK_MODEL; // optional override: provider/model-id
@@ -158,7 +185,15 @@ export default function (pi: ExtensionAPI) {
 		return ctx.model; // CC uses the main session's model (JR() -> mainLoopModel)
 	};
 
+	const notesFile = (ctx: ExtensionContext) =>
+		join(ctx.sessionManager.getSessionDir(), "artifacts", ctx.sessionManager.getSessionId(), "you-should-know.json");
+	const persistNotes = (ctx: ExtensionContext) => {
+		const file = notesFile(ctx);
+		atomicJson(file, { notes, answered: [...answered] });
+	};
+
 	const render = (ctx: ExtensionContext) => {
+		persistNotes(ctx);
 		if (ctx.mode !== "tui") return;
 		if (notes.length === 0) {
 			ctx.ui.setWidget(WIDGET, undefined);
@@ -297,20 +332,28 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// Parent side: pick up notes relayed by herdr subagents.
+	const queuedRelays = new Set<string>();
 	let inboxTimer: ReturnType<typeof setInterval> | undefined;
 	const inboxDir = (ctx: ExtensionContext) =>
 		join(ctx.sessionManager.getSessionDir(), "artifacts", ctx.sessionManager.getSessionId(), INBOX);
 	function drainInbox(ctx: ExtensionContext) {
 		const dir = inboxDir(ctx);
 		if (!existsSync(dir)) return;
-		for (const f of readdirSync(dir).filter((f) => f.endsWith(".json")).sort()) {
+		const files = readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+		if (files.length === 0) return;
+		const delivered = new Set(ctx.sessionManager.getEntries().flatMap((entry) =>
+			entry.type === "custom_message" && entry.customType === "you-should-know" &&
+			entry.details && typeof entry.details === "object" && "relayId" in entry.details
+				? [entry.details.relayId] : []));
+		for (const f of files) {
 			const path = join(dir, f);
 			try {
+				if (delivered.has(f)) { unlinkSync(path); queuedRelays.delete(f); continue; }
+				if (queuedRelays.has(f)) continue;
 				const n = JSON.parse(readFileSync(path, "utf8"));
-				unlinkSync(path);
 				if (!n?.line || !state.enabled) continue;
 				// Feed it to the parent agent as a message. Busy: steer into the current run.
-				// Idle: queue for the next turn rather than waking the agent on its own.
+				// Idle: append to Pi's durable conversation without waking the agent.
 				const tag = n.tag === "Heads up" ? "Heads up" : "You should know";
 				const body = [`${tag} \u00b7 ${n.line}`, ...(n.evidence ? [`Evidence: ${n.evidence}`] : []), ...(n.explanation ? ["", n.explanation] : [])]
 					.join("\n").split("\n").map((l: string) => (l === "" ? ">" : `> ${l}`)).join("\n");
@@ -320,19 +363,30 @@ export default function (pi: ExtensionAPI) {
 						customType: "you-should-know",
 						content: `Your subagent "${n.from ?? "subagent"}" raised a note its side agent thinks you (and the user) should know. It's about the subagent's work; you can't see its conversation. Weigh it and act or mention it if it matters:\n${body}`,
 						display: true,
-						details: n,
+						details: { ...n, relayId: f },
 					},
-					idle ? { deliverAs: "nextTurn" } : { deliverAs: "steer" },
+					idle ? {} : { deliverAs: "steer" },
 				);
-				log({ event: "relayed_in", from: n.from, line: n.line, deliverAs: idle ? "nextTurn" : "steer" });
+				queuedRelays.add(f);
+				log({ event: "relayed_in", from: n.from, line: n.line, deliverAs: idle ? "persisted" : "steer" });
 			} catch {}
 		}
 	}
 
 	pi.on("session_start", (_e, ctx) => {
 		state = loadState();
+		queuedRelays.clear();
+		inFlight?.abort();
+		inFlight = undefined;
 		notes = [];
-		unannounced = [];
+		answered = new Map();
+		try {
+			const saved = JSON.parse(readFileSync(notesFile(ctx), "utf8"));
+			notes = saved.notes;
+			answered = new Map(saved.answered);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 		promptCounter = 0;
 		render(ctx);
 		if (inboxTimer) clearInterval(inboxTimer);
@@ -350,25 +404,21 @@ export default function (pi: ExtensionAPI) {
 		inboxTimer = undefined;
 	});
 
-	// RPC clients only show a notify while a run is going (T3 Code drops one between turns),
-	// so a note found after the run settled waits for the next one.
+	// T3 accepts notices between turns.
 	const noteText = (n: Note) =>
 		`[ysk:${n.id}] ${n.tag} \u00b7 ${n.line}${n.evidence ? ` (${n.evidence})` : ""}` +
 		(n.explanation ? `\n\n${n.explanation}` : "");
 	function announce(ctx: ExtensionContext, n: Note) {
-		if (ctx.isIdle()) unannounced.push(n);
-		else ctx.ui.notify(noteText(n), "info");
+		ctx.ui.notify(noteText(n), "info");
+		persistNotes(ctx);
 	}
-	pi.on("agent_start", (_e, ctx) => {
-		if (ctx.mode === "tui") return;
-		for (const n of unannounced.splice(0)) if (notes.includes(n)) ctx.ui.notify(noteText(n), "info");
-	});
+
 
 	// A note that survives PROMPTS_SURVIVED user prompts unanswered counts as ignored (for backoff),
 	// but stays on screen so notes can pile up until you answer or dismiss them.
-	// RPC clients answer notes in their own UI and report only answers, so nothing counts as ignored there.
+	// Unanswered notes count in RPC clients too. Extension commands are not user prompts.
 	pi.on("input", (e, ctx) => {
-		if (e.source === "extension" || ctx.mode !== "tui") return;
+		if (e.source === "extension" || e.text.trim().startsWith("/ysk")) return;
 		promptCounter++;
 		let changed = false;
 		for (const n of notes) {
@@ -379,6 +429,7 @@ export default function (pi: ExtensionAPI) {
 			state.ignoredInARow++;
 			changed = true;
 		}
+		persistNotes(ctx);
 		if (!changed) return;
 		state.skip = backoff(state.ignoredInARow);
 		saveState(state);
@@ -443,7 +494,7 @@ export default function (pi: ExtensionAPI) {
 							} catch {}
 						}
 						notes.push(note);
-						while (notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
+						while (ctx.mode === "tui" && notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
 						render(ctx);
 						if (ctx.mode !== "tui") announce(ctx, note);
 					}
@@ -535,7 +586,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (arg === "test") {
 			// A sample note, shown at once, to check the display path without waiting for a real one.
-			const note: Note = { id: "test" + Date.now().toString(36), line: "This is a test note from /ysk test.", tag: "Heads up", evidence: "/ysk test", explanation: "Nothing is wrong. This note only checks that notes reach your screen.", shownAt: Date.now(), promptsSurvived: 0 };
+			const note: Note = { id: "test" + crypto.randomUUID(), line: "This is a test note from /ysk test.", tag: "Heads up", evidence: "/ysk test", explanation: "Nothing is wrong. This note only checks that notes reach your screen.", shownAt: Date.now(), promptsSurvived: 0 };
 			notes.push(note);
 			render(ctx);
 			if (ctx.mode !== "tui") ctx.ui.notify(noteText(note), "info");
@@ -575,7 +626,7 @@ export default function (pi: ExtensionAPI) {
 		const k = pick[0];
 		log({ event: "answer", answer: { "1": "learn_more", "2": "knew", "3": "chat", "0": "dismiss" }[k], line: n.line, msToAnswer: Date.now() - n.shownAt });
 		if (k === "1") await showExplanation(ctx, n).catch((err) => ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error"));
-		else if (k === "2") state.known = [...state.known.filter((x) => norm(x) !== norm(n.line)), n.line].slice(-HISTORY_MAX);
+		else if (k === "2") remember(n.line, true);
 		else if (k === "3") chatInMain(n, n.explanation);
 		saveState(state);
 	}
@@ -587,18 +638,27 @@ export default function (pi: ExtensionAPI) {
 	function answerFromClient(ctx: ExtensionContext, rest: string) {
 		const [id, action] = rest.trim().split(/\s+/);
 		const answer = action && Object.hasOwn(CLIENT_ANSWERS, action) ? CLIENT_ANSWERS[action] : undefined;
-		const n = notes.find((x) => x.id === id);
+		const prior = answered.get(id);
+		const n = notes.find((x) => x.id === id) ?? prior?.note;
+		if (n && action === "undo") {
+			if (prior?.action === "knew") remember(n.line, false);
+			answered.delete(id);
+			if (!notes.some((x) => x.id === id)) notes.push(n);
+			saveState(state);
+			render(ctx);
+			return;
+		}
 		if (!n || !answer) {
 			log({ event: "answer_ignored", id, action, via: "client" });
 			return;
 		}
+		answered.set(id, { note: n, action });
 		notes = notes.filter((x) => x !== n);
-		unannounced = unannounced.filter((x) => x !== n);
-		render(ctx);
 		state.ignoredInARow = 0;
 		state.skip = 0;
-		if (answer === "knew") state.known = [...state.known.filter((x) => norm(x) !== norm(n.line)), n.line].slice(-HISTORY_MAX);
+		if (answer === "knew") remember(n.line, true);
 		saveState(state);
+		render(ctx);
 		log({ event: "answer", answer, via: "client", line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 

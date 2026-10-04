@@ -15,9 +15,11 @@ It's a port of the "you should know" plugin built into Claude Code.
 
 If you keep ignoring notes, it checks less often. Answering any note resets that.
 
+Open notes and answer history are saved with the Pi session. Knew and Undo feedback is saved under `~/.pi/agent/you-should-know/` (or your `PI_CODING_AGENT_DIR`), so separate Pi sessions cannot overwrite one another’s feedback. Relayed child notes stay in the inbox until they appear in the parent’s saved conversation.
+
 ## In RPC clients
 
-Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. The client reports each answer back with `/ysk answer <id> <action>` (`knew`, `dismiss`, `learn` or `send`); that removes the note silently and, for `knew`, remembers it as something you know. A note found after a run has finished is sent at the start of the next run. `/ysk` still works there through the client's dialogs.
+Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. The client reports each answer back with `/ysk answer <id> <action>` (`knew`, `dismiss`, `learn` or `send`); that removes the note silently and, for `knew`, remembers it as something you know. Notes are sent immediately, including between runs. T3 Code shows them in its heads-up band; `/ysk` points to those controls. Notes and answers survive a Pi restart. The client can undo an answer with `/ysk answer <id> undo`, which also removes a previous `knew` answer. Unanswered notes reduce the check frequency in RPC clients too.
 
 ## With herdr subagents
 
