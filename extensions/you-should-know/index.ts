@@ -9,7 +9,8 @@
 //
 // Outside the terminal UI (RPC clients such as T3 Code) there is no widget or custom component.
 // Each note is sent once as a notify, `[ysk:<id>] <tag> · <line> (<evidence>)` followed by its
-// explanation, for the client to show and answer itself; /ysk still works through select dialogs.
+// explanation, for the client to show and answer itself. The client reports each answer back
+// with `/ysk answer <id> <action>`.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
@@ -360,7 +361,7 @@ export default function (pi: ExtensionAPI) {
 
 	// A note that survives PROMPTS_SURVIVED user prompts unanswered counts as ignored (for backoff),
 	// but stays on screen so notes can pile up until you answer or dismiss them.
-	// RPC clients answer notes themselves without telling us, so nothing counts as ignored there.
+	// RPC clients answer notes in their own UI and report only answers, so nothing counts as ignored there.
 	pi.on("input", (e, ctx) => {
 		if (e.source === "extension" || ctx.mode !== "tui") return;
 		promptCounter++;
@@ -535,6 +536,10 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.mode !== "tui") ctx.ui.notify(noteText(note), "info");
 			return;
 		}
+		if (arg?.startsWith("answer ")) {
+			answerFromClient(ctx, arg.slice("answer ".length));
+			return;
+		}
 		if (arg === "status") {
 			ctx.ui.notify(
 				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${pickModel(ctx)?.id ?? "?"} \u00b7 log ${LOG_FILE}`,
@@ -568,6 +573,28 @@ export default function (pi: ExtensionAPI) {
 		else if (k === "2") state.known = [...state.known.filter((x) => norm(x) !== norm(n.line)), n.line].slice(-HISTORY_MAX);
 		else if (k === "3") chatInMain(n, n.explanation);
 		saveState(state);
+	}
+
+	// RPC clients answer notes in their own UI, then send `/ysk answer <id> <action>`
+	// (T3 Code's actions: knew, dismiss, learn, send). The client already showed the
+	// explanation or quoted the note to the agent, so this only records the answer.
+	const CLIENT_ANSWERS: Record<string, string> = { knew: "knew", dismiss: "dismiss", learn: "learn_more", send: "chat" };
+	function answerFromClient(ctx: ExtensionContext, rest: string) {
+		const [id, action] = rest.trim().split(/\s+/);
+		const answer = action && Object.hasOwn(CLIENT_ANSWERS, action) ? CLIENT_ANSWERS[action] : undefined;
+		const n = notes.find((x) => x.id === id);
+		if (!n || !answer) {
+			log({ event: "answer_ignored", id, action, via: "client" });
+			return;
+		}
+		notes = notes.filter((x) => x !== n);
+		unannounced = unannounced.filter((x) => x !== n);
+		render(ctx);
+		state.ignoredInARow = 0;
+		state.skip = 0;
+		if (answer === "knew") state.known = [...state.known.filter((x) => norm(x) !== norm(n.line)), n.line].slice(-HISTORY_MAX);
+		saveState(state);
+		log({ event: "answer", answer, via: "client", line: n.line, msToAnswer: Date.now() - n.shownAt });
 	}
 
 	// One keystroke: dismiss the top note, no menu.

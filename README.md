@@ -17,7 +17,7 @@ If you keep ignoring notes, it checks less often. Answering any note resets that
 
 ## In RPC clients
 
-Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. A note found after a run has finished is sent at the start of the next run. `/ysk` still works there through the client's dialogs.
+Without Pi's terminal UI (for example in T3 Code), each note is sent once as a notification in the form `[ysk:<id>] <tag> · <line> (<evidence>)`, followed by its explanation, so the client can show and answer it. The client reports each answer back with `/ysk answer <id> <action>` (`knew`, `dismiss`, `learn` or `send`); that removes the note silently and, for `knew`, remembers it as something you know. A note found after a run has finished is sent at the start of the next run. `/ysk` still works there through the client's dialogs.
 
 ## With herdr subagents
 
