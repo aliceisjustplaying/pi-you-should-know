@@ -1,0 +1,134 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { zstdDecompressSync } from 'node:zlib';
+
+// Real Pi and real provider serializers, with local protocol servers instead of
+// paid models. The wire request, resulting check and RPC notice own the contract.
+const cases = [
+  { name: 'GPT default', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6.1-sol', thinking: 'high' },
+  { name: 'GPT configurable same-model thinking', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'medium', config: { gpt: { model: 'openai/gpt-6-astra', thinking: 'medium' } } },
+  { name: 'GPT environment model override', api: 'openai-completions', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', override: 'openai/gpt-6-sol' },
+  { name: 'Fable family default', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5-1', side: 'claude-opus-5-5', thinking: 'medium' },
+  { name: 'Fable configurable model and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5', side: 'claude-sonnet-5', thinking: 'high', config: { fable: { model: 'anthropic/claude-sonnet-5', thinking: 'high' } } },
+  { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low' },
+  { name: 'unknown configured model does not fall back to main', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', config: { gpt: { model: 'openai/not-a-registered-model' } }, missing: true },
+  { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol' } }, error: true },
+];
+
+for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ysk-route-'));
+  const agentDir = join(root, 'agent');
+  const logDir = join(agentDir, 'you-should-know');
+  mkdirSync(logDir, { recursive: true });
+  if (scenario.config) writeFileSync(join(logDir, 'config.json'), JSON.stringify(scenario.config));
+  const receipt = join(root, 'receipt.txt');
+  writeFileSync(receipt, 'Local fixture.');
+  let child, mainPayload, sidePayload, stderr = '';
+  const notices = [];
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    const payload = JSON.parse((request.headers['content-encoding'] === 'zstd' ? zstdDecompressSync(body) : body).toString());
+    const messages = payload.input ?? payload.messages;
+    const side = JSON.stringify(messages).includes('These are the last suggestions offered');
+    if (side) sidePayload = payload; else mainPayload = payload;
+    if (side && scenario.error) {
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: 'fixture rejection: invalid request', type: 'invalid_request_error' } }));
+      return;
+    }
+    const steps = messages.filter(m => m.role === 'tool' || m.type === 'function_call_output').length
+      + messages.flatMap(m => Array.isArray(m.content) ? m.content : []).filter(c => c.type === 'tool_result').length;
+    const tool = !side && steps < 7;
+    const text = side ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.' : 'Done.';
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    const event = (type, fields) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
+    if (scenario.api === 'anthropic-messages') {
+      event('message_start', { message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: payload.model, content: [], usage: { input_tokens: 10, output_tokens: 0 } } });
+      event('content_block_start', { index: 0, content_block: tool ? { type: 'tool_use', id: `read_${steps}`, name: 'read', input: {} } : { type: 'text', text: '' } });
+      event('content_block_delta', { index: 0, delta: tool ? { type: 'input_json_delta', partial_json: JSON.stringify({ path: receipt }) } : { type: 'text_delta', text } });
+      event('content_block_stop', { index: 0 });
+      event('message_delta', { delta: { stop_reason: tool ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: 10 } });
+      event('message_stop', {});
+    } else if (scenario.api === 'openai-completions') {
+      const frame = value => response.write(`data: ${JSON.stringify({ id: 'local', object: 'chat.completion.chunk', created: 1, model: payload.model, choices: [value] })}\n\n`);
+      frame({ index: 0, delta: tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `read-${steps}`, type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: receipt }) } }] } : { role: 'assistant', content: text }, finish_reason: null });
+      frame({ index: 0, delta: {}, finish_reason: tool ? 'tool_calls' : 'stop' });
+      response.write('data: [DONE]\n\n');
+    } else {
+      const item = tool ? { type: 'function_call', id: `fc_${steps}`, call_id: `read_${steps}`, name: 'read', arguments: JSON.stringify({ path: receipt }), status: 'completed' }
+        : { type: 'message', id: 'msg_fixture', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text, annotations: [] }] };
+      event('response.output_item.added', { output_index: 0, item: tool ? { ...item, arguments: '' } : { ...item, content: [] } });
+      if (tool) event('response.function_call_arguments.delta', { output_index: 0, delta: item.arguments });
+      else event('response.output_text.delta', { output_index: 0, content_index: 0, delta: text });
+      event('response.output_item.done', { output_index: 0, item });
+      event('response.completed', { response: { id: `resp_${steps}`, status: 'completed', output: [item], usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } } });
+    }
+    response.end();
+  });
+  // Codex auto transport falls back to SSE without waiting for a WS timeout.
+  server.on('upgrade', (_request, socket) => { socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); });
+  try {
+    server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    const key = scenario.api === 'openai-codex-responses' ? `fixture.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'local-fixture' } })).toString('base64url')}.fixture` : 'local-only';
+    const models = [...new Set([scenario.main, scenario.side])].map(id => ({ id, contextWindow: 128000, maxTokens: 16384, reasoning: true, compat: scenario.api === 'anthropic-messages' ? { forceAdaptiveThinking: true, supportsMidConvoEffort: id === 'claude-opus-5-5', supportsMidConvoSystemMessages: true } : undefined }));
+    writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: { [scenario.provider]: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: scenario.api, apiKey: key, models } } }));
+    const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, YSK_DEBUG: '1' };
+    delete env.PI_SUBAGENT_ACTIVITY_FILE; delete env.YSK_MODEL;
+    if (scenario.override) env.YSK_MODEL = scenario.override;
+    const check = await new Promise((resolve, reject) => {
+      child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-skills', '--no-context-files', '--no-extensions', '-e', process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url)), '--provider', scenario.provider, '--model', scenario.main, '--thinking', 'low', '--session', join(root, 'session.jsonl')], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], signal: AbortSignal.timeout(18_000) });
+      child.on('error', reject);
+      child.on('exit', () => reject(new Error(`Pi exited before check: ${stderr}`)));
+      child.stderr.on('data', data => { stderr += data; });
+      let buffer = '';
+      child.stdout.on('data', data => {
+        buffer += data;
+        for (;;) {
+          const at = buffer.indexOf('\n'); if (at < 0) break;
+          const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
+          let event; try { event = JSON.parse(line); } catch { continue; }
+          if (event.method === 'notify') {
+            notices.push(event.message);
+            if (event.message.startsWith('you-should-know: step 6 ')) resolve(JSON.parse(readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim()));
+          }
+          if (event.type === 'extension_error' || event.type === 'response' && !event.success) reject(new Error(JSON.stringify(event)));
+        }
+      });
+      child.stdin.write(JSON.stringify({ type: 'prompt', message: 'Read receipt.txt seven times, then finish.' }) + '\n');
+    });
+    assert.equal(check.outcome, scenario.error || scenario.missing ? 'error' : 'shown', JSON.stringify(check));
+    if (scenario.missing) {
+      assert.match(check.error, /YSK model not found: openai\/not-a-registered-model/);
+      assert.equal(sidePayload, undefined);
+      assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
+      return;
+    }
+    assert.equal(sidePayload.model, scenario.side);
+    const effort = p => p.reasoning?.effort ?? p.reasoning_effort ?? p.messages?.findLast(m => m.output_config)?.output_config.effort ?? p.output_config?.effort;
+    assert.equal(effort(mainPayload), 'low');
+    assert.equal(effort(sidePayload), scenario.thinking);
+    if (scenario.name.startsWith('other Claude')) {
+      assert.deepEqual(sidePayload.tools, mainPayload.tools);
+      assert.deepEqual(sidePayload.system, mainPayload.system);
+      assert.equal(check.align.aligned, true);
+    } else {
+      assert.equal(sidePayload.tool_choice?.type ?? sidePayload.tool_choice, 'none');
+    }
+    if (scenario.error) {
+      assert.match(check.error, /fixture rejection/);
+      assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
+    } else assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 1);
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited; }
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  }
+});

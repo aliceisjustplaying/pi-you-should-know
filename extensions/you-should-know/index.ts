@@ -1,7 +1,7 @@
 // You Should Know: a port of Claude Code's built-in `cc-plugin-you-should-know` mod (v2.1.287).
 //
-// Every 6th turn of an agent run, fork the live conversation (same model, same cached prefix,
-// via turn_end's `context.llmMessages`), append the original detect prompt, and ask whether
+// Every 6th turn of an agent run, fork the live conversation via turn_end's
+// `context.llmMessages`, select a side model, append the detect prompt and ask whether
 // there's something the user should know but probably missed. Most of the time the answer is
 // `learn: none`. When it isn't, show a note above the editor. Respond with /ysk (or alt+shift+y).
 //
@@ -33,6 +33,7 @@ const backoff = (ignoredInARow: number) =>
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DETECT_TEMPLATE = readFileSync(join(HERE, "detect-prompt.md"), "utf8");
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+const CONFIG_FILE = join(AGENT_DIR, "you-should-know", "config.json");
 const STATE_FILE = join(AGENT_DIR, "you-should-know", "state.json");
 const KNOWLEDGE_FILE = join(AGENT_DIR, "you-should-know", "knowledge.jsonl");
 const LOG_FILE = join(AGENT_DIR, "you-should-know", "checks.jsonl");
@@ -175,14 +176,27 @@ export default function (pi: ExtensionAPI) {
 		state.known = readKnowledge(state.known);
 	};
 
+	// Explicit provider/model IDs keep authentication on the selected provider.
+	const defaultRoutes = {
+		gpt: { model: "openai-codex/gpt-6.1-sol", thinking: "high" },
+		fable: { model: "anthropic/claude-opus-5-5", thinking: "medium" },
+	} as const;
+	const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 	const pickModel = (ctx: ExtensionContext) => {
-		const o = process.env.YSK_MODEL; // optional override: provider/model-id
-		if (o && o.includes("/")) {
-			const i = o.indexOf("/");
-			const m = ctx.modelRegistry.find(o.slice(0, i), o.slice(i + 1));
-			if (m) return m;
-		}
-		return ctx.model; // CC uses the main session's model (JR() -> mainLoopModel)
+		const id = ctx.model?.id.split("/").at(-1) ?? "";
+		const family = /^gpt-/i.test(id) ? "gpt" : /^claude-fable(?:-|$)/i.test(id) ? "fable" : undefined;
+		const config = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
+		const route = family ? { ...defaultRoutes[family], ...config[family] } : undefined;
+		const override = process.env.YSK_MODEL?.trim();
+		if (!override && !route) return { model: ctx.model, thinking: undefined };
+		const requested = override || route?.model;
+		if (typeof requested !== "string" || !requested.includes("/")) throw new Error("YSK model must be provider/model-id");
+		const at = requested.indexOf("/");
+		const model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
+		if (!model) throw new Error(`YSK model not found: ${requested}`);
+		const thinking = route?.thinking;
+		if (thinking !== undefined && !thinkingLevels.includes(thinking)) throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
+		return { model, thinking };
 	};
 
 	const notesFile = (ctx: ExtensionContext) =>
@@ -226,19 +240,30 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	async function fork(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
-		const model = pickModel(ctx);
+		const { model, thinking } = pickModel(ctx);
 		if (!model) throw new Error("no model");
 		const messages = [
 			...llmMessages,
 			{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() },
 		];
 		const hasSystem = llmMessages[0]?.role === "system";
-		const res = await ctx.modelRegistry.complete(
-			model,
-			{ messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) } as any,
-			{ signal, sessionId: ctx.sessionManager.getSessionId(), onPayload: (p: unknown) => alignWithMain(p) } as any,
-		);
-		return { text: textOf(res as any), usage: (res as any).usage, stopReason: (res as any).stopReason };
+		const context = { messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) } as any;
+		const options = {
+			signal, sessionId: ctx.sessionManager.getSessionId(),
+			onPayload: (p: unknown) => {
+				// Anthropic cache alignment must not overwrite a routed model's
+				// converted history or its independent thinking setting.
+				if (model.api === "anthropic-messages" && model.provider === ctx.model?.provider && model.id === ctx.model?.id && thinking === undefined) return alignWithMain(p);
+				lastAlign = { aligned: false, why: "independent side request" };
+				return undefined;
+			},
+		};
+		// Preserve the working same-model Claude path. Routes use Pi's neutral
+		// thinking option, translated by each provider to its native wire format.
+		const res = thinking === undefined && model.api === "anthropic-messages"
+			? await ctx.modelRegistry.complete(model, context, options)
+			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking, toolChoice: "none" }).result();
+		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking };
 	}
 
 	let lastLlmMessages: any[] = [];
@@ -465,8 +490,9 @@ export default function (pi: ExtensionAPI) {
 			let extra: Record<string, unknown> = {};
 			try {
 				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason };
-				if (ac.signal.aborted) outcome = "aborted";
+				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking };
+				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
+				else if (r.stopReason === "error") outcome = "error";
 				else if (!r.text) outcome = "empty";
 				else {
 					const p = parse(r.text);
@@ -602,8 +628,9 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (arg === "status") {
+			const { model, thinking } = pickModel(ctx);
 			ctx.ui.notify(
-				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${pickModel(ctx)?.id ?? "?"} \u00b7 log ${LOG_FILE}`,
+				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${model?.provider ?? "?"}/${model?.id ?? "?"} \u00b7 thinking ${thinking ?? "main request"} \u00b7 config ${CONFIG_FILE} \u00b7 log ${LOG_FILE}`,
 				"info",
 			);
 			return;

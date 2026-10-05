@@ -25,9 +25,30 @@ Without Pi's terminal UI (for example in T3 Code), each note is sent once as a n
 
 When the extension runs inside a [pi-herdr-subagents](https://github.com/aliceisjustplaying/pi-herdr-subagents) subagent, its notes aren't shown in the subagent's pane. They're passed to the parent agent as a message instead, labeled with the subagent's name, so the agent that's coordinating the work can act on them.
 
+## Side models
+
+YSK uses these defaults, independently of the main agent's thinking level:
+
+- GPT models → `openai-codex/gpt-6.1-sol`, high thinking.
+- Claude Fable models (including versioned variants) → `anthropic/claude-opus-5-5`, medium thinking.
+- Other models → the main model. Other Claude models keep their existing same-model request behavior.
+
+Both family routes are configurable in `~/.pi/agent/you-should-know/config.json` (under `PI_CODING_AGENT_DIR` when set):
+
+```json
+{
+  "gpt": { "model": "openai-codex/gpt-6.1-sol", "thinking": "high" },
+  "fable": { "model": "anthropic/claude-opus-5-5", "thinking": "medium" }
+}
+```
+
+Each model value is a registered `provider/model-id`, using that provider's credentials. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. Missing fields use the defaults above. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
+
+The existing `YSK_MODEL` environment variable overrides the model for any family, including other Claude models. It does not override the GPT/Fable thinking setting. Unknown model IDs fail the check rather than silently using the main model.
+
 ## Cost
 
-Each check reuses the conversation the main agent already cached, so it costs a fraction of a normal turn. Every check is logged, with token usage, to `~/.pi/agent/you-should-know/checks.jsonl`.
+Same-model Claude checks reuse the main request's cached prefix. A different side model still receives the conversation, but can cost more because that cache reuse is not guaranteed. Every check is logged, with token usage, to `~/.pi/agent/you-should-know/checks.jsonl`.
 
 ## Install
 
