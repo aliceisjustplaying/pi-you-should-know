@@ -315,7 +315,7 @@ export default function (pi: ExtensionAPI) {
 				if (signal.aborted) throw error;
 				log({
 					event: "ysk_fallback_result", reason, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
-					responseOutcome: "request_error", provider: fallbackProvider, model: fallbackModel,
+					responseOutcome: "request_error", error: String(error), provider: fallbackProvider, model: fallbackModel,
 					primaryUsage: primary?.usage,
 				});
 				throw new Error("YSK fallback request failed", { cause: error });
