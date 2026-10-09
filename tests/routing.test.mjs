@@ -26,6 +26,11 @@ const cases = [
   { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low' },
   { name: 'unknown configured model does not fall back to main', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', config: { gpt: { model: 'openai/not-a-registered-model' } }, missing: true },
   { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol' } }, error: true },
+  { name: 'MiniMax failure uses GPT Luna once for detection and explanation', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true, explain: true, checkStatus: true, reconfigureAfterDetect: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'medium' } } },
+  { name: 'MiniMax thrown request error uses GPT Luna once', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryThrow: true },
+  { name: 'learn none does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', none: true },
+  { name: 'unregistered fallback fails fast without a side request', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/not-registered', thinking: 'off' } }, invalidFallback: true },
+  { name: 'both primary and fallback errors remain visible and do not retry', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true, fallbackError: true },
 ];
 
 for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () => {
@@ -41,6 +46,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   const sidePayloads = [];
   const sideRequestTexts = [];
   const sideRequestUrls = [];
+  const sideRoutes = [];
   const mainRequestUrls = [];
   const notices = [];
   let statusMessage = '';
@@ -52,27 +58,36 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const serializedMessages = JSON.stringify(messages);
     const side = serializedMessages.includes('These are the last suggestions offered') || serializedMessages.includes('The person watching you work said yes to:');
     const explaining = serializedMessages.includes('The person watching you work said yes to:');
-    if (side) { sidePayload = payload; sidePayloads.push(payload); sideRequestTexts.push(serializedMessages); sideRequestUrls.push(request.url); } else { mainPayload = payload; mainRequestUrls.push(request.url); }
-    if (side && !explaining && scenario.reconfigureAfterDetect) writeFileSync(configFile, JSON.stringify(scenario.reconfigureAfterDetect));
-    if (side && scenario.error) {
+    const provider = request.url.split('/')[1];
+    const isFallback = side && scenario.fallback && payload.model === scenario.fallback.model;
+    if (side) { sidePayload = payload; sidePayloads.push(payload); sideRequestTexts.push(serializedMessages); sideRequestUrls.push(request.url); sideRoutes.push({ payload, url: request.url, provider, explaining, isFallback }); } else { mainPayload = payload; mainRequestUrls.push(request.url); }
+    if (side && !explaining && !isFallback && scenario.reconfigureAfterDetect) writeFileSync(configFile, JSON.stringify(scenario.reconfigureAfterDetect));
+    if (side && !isFallback && (scenario.error || scenario.primaryError)) {
       response.writeHead(400, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'fixture rejection: invalid request', type: 'invalid_request_error' } }));
+      return;
+    }
+    if (side && !isFallback && scenario.primaryThrow) { request.socket.destroy(); return; }
+    if (side && isFallback && scenario.fallbackError) {
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ error: { message: 'fixture fallback rejection', type: 'invalid_request_error' } }));
       return;
     }
     const steps = messages.filter(m => m.role === 'tool' || m.type === 'function_call_output').length
       + messages.flatMap(m => Array.isArray(m.content) ? m.content : []).filter(c => c.type === 'tool_result').length;
     const tool = !side && steps < 7;
-    const text = !side ? 'Done.' : explaining ? 'The fixture explanation uses the selected side model.' : scenario.explain ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt' : 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.';
+    const text = !side ? 'Done.' : explaining ? 'The fixture explanation uses the selected side model.' : scenario.none ? 'learn: none' : scenario.explain ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt' : 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.';
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const event = (type, fields) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
-    if (scenario.api === 'anthropic-messages') {
+    const requestApi = provider === scenario.provider ? scenario.api : provider === (scenario.sideProvider ?? scenario.provider) ? (scenario.sideApi ?? scenario.api) : scenario.fallbackApi;
+    if (requestApi === 'anthropic-messages') {
       event('message_start', { message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: payload.model, content: [], usage: { input_tokens: 10, output_tokens: 0 } } });
       event('content_block_start', { index: 0, content_block: tool ? { type: 'tool_use', id: `read_${steps}`, name: 'read', input: {} } : { type: 'text', text: '' } });
       event('content_block_delta', { index: 0, delta: tool ? { type: 'input_json_delta', partial_json: JSON.stringify({ path: receipt }) } : { type: 'text_delta', text } });
       event('content_block_stop', { index: 0 });
       event('message_delta', { delta: { stop_reason: tool ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: { output_tokens: 10 } });
       event('message_stop', {});
-    } else if (scenario.api === 'openai-completions') {
+    } else if (requestApi === 'openai-completions') {
       const frame = value => response.write(`data: ${JSON.stringify({ id: 'local', object: 'chat.completion.chunk', created: 1, model: payload.model, choices: [value] })}\n\n`);
       frame({ index: 0, delta: tool ? { role: 'assistant', tool_calls: [{ index: 0, id: `read-${steps}`, type: 'function', function: { name: 'read', arguments: JSON.stringify({ path: receipt }) } }] } : { role: 'assistant', content: text }, finish_reason: null });
       frame({ index: 0, delta: {}, finish_reason: tool ? 'tool_calls' : 'stop' });
@@ -95,11 +110,12 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const keyFor = api => api === 'openai-codex-responses' ? `fixture.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'local-fixture' } })).toString('base64url')}.fixture` : 'local-only';
     const mainProvider = scenario.provider;
     const sideProvider = scenario.sideProvider ?? scenario.provider;
-    const apiFor = provider => provider === mainProvider ? scenario.api : (scenario.sideApi ?? scenario.api);
+    const fallbackProvider = scenario.fallback?.provider;
+    const apiFor = provider => provider === mainProvider ? scenario.api : provider === fallbackProvider ? scenario.fallbackApi : (scenario.sideApi ?? scenario.api);
     const providers = {};
-    for (const provider of new Set([mainProvider, sideProvider])) {
+    for (const provider of new Set([mainProvider, sideProvider, ...(fallbackProvider ? [fallbackProvider] : [])])) {
       const api = apiFor(provider);
-      const ids = [...new Set([...(provider === mainProvider ? [scenario.main] : []), ...(provider === sideProvider ? [scenario.side] : [])])];
+      const ids = [...new Set([...(provider === mainProvider ? [scenario.main] : []), ...(provider === sideProvider ? [scenario.side] : []), ...(provider === fallbackProvider ? [scenario.fallback.model] : [])])];
       const models = ids.map(id => ({ id, contextWindow: 128000, maxTokens: 16384, reasoning: true, compat: api === 'anthropic-messages' ? { forceAdaptiveThinking: true, supportsMidConvoEffort: id === 'claude-opus-5-5', supportsMidConvoSystemMessages: true } : undefined }));
       providers[provider] = { baseUrl: `http://127.0.0.1:${server.address().port}/${provider}/v1`, api, apiKey: keyFor(api), models };
     }
@@ -125,16 +141,16 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
               statusMessage = event.message;
               child.stdin.write(JSON.stringify({ type: 'prompt', message: 'Read receipt.txt seven times, then finish.' }) + '\n');
             }
-            if (event.message.startsWith('you-should-know: step 6 ')) resolve(JSON.parse(readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim()));
+            if (event.message.startsWith('you-should-know: step 6 ')) resolve(JSON.parse(readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim().split('\n').at(-1)));
           }
           if (event.type === 'extension_error' || event.type === 'response' && !event.success) reject(new Error(JSON.stringify(event)));
         }
       });
       child.stdin.write(JSON.stringify({ type: 'prompt', message: scenario.checkStatus ? '/ysk status' : 'Read receipt.txt seven times, then finish.' }) + '\n');
     });
-    assert.equal(check.outcome, scenario.error || scenario.missing || scenario.invalidModel || scenario.invalidThinking ? 'error' : 'shown', JSON.stringify(check));
-    if (scenario.invalidModel || scenario.invalidThinking) {
-      assert.match(check.error, scenario.invalidModel ? /YSK model must be provider\/model-id/ : /Invalid YSK thinking level/);
+    assert.equal(check.outcome, scenario.error || scenario.missing || scenario.invalidModel || scenario.invalidThinking || scenario.invalidFallback || scenario.fallbackError ? 'error' : scenario.none ? 'none' : 'shown', JSON.stringify(check));
+    if (scenario.invalidModel || scenario.invalidThinking || scenario.invalidFallback) {
+      assert.match(check.error, scenario.invalidModel ? /YSK model must be provider\/model-id/ : scenario.invalidFallback ? /YSK fallback model not found: openai\/not-registered/ : /Invalid YSK thinking level/);
       assert.equal(sidePayload, undefined);
       assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
       return;
@@ -145,18 +161,32 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
       return;
     }
-    assert.equal(sidePayload.model, scenario.side);
-    if (scenario.checkStatus) assert.match(statusMessage, /model openai\/gpt-6\.1-sol · thinking high/);
+    const primaryRoutes = sideRoutes.filter(route => !route.isFallback);
+    assert.equal(primaryRoutes[0]?.payload.model, scenario.side);
+    if (scenario.checkStatus) {
+      if (scenario.fallback) assert.match(statusMessage, /model minimax-cn\/MiniMax-M3\.1-Flash-Preview · thinking off · fallback openai\/gpt-6-luna · thinking off/);
+      else assert.match(statusMessage, /model openai\/gpt-6\.1-sol · thinking high/);
+    }
     assert.ok(mainRequestUrls.every(url => url.includes(`/${scenario.provider}/v1/`)), JSON.stringify(mainRequestUrls));
-    assert.ok(sideRequestUrls.every(url => url.includes(`/${scenario.sideProvider ?? scenario.provider}/v1/`)), JSON.stringify(sideRequestUrls));
+    assert.ok(primaryRoutes.every(route => route.url.includes(`/${scenario.sideProvider ?? scenario.provider}/v1/`)), JSON.stringify(primaryRoutes.map(route => route.url)));
     const effort = p => p.reasoning?.effort ?? p.reasoning_effort ?? p.messages?.findLast(m => m.output_config)?.output_config.effort ?? p.output_config?.effort;
     assert.equal(effort(mainPayload), 'low');
-    for (const [index, payload] of sidePayloads.entries()) {
-      assert.equal(payload.model, scenario.side);
-      assert.equal(effort(payload), scenario.thinkingByRequest?.[index] ?? scenario.thinking);
+    if (scenario.fallback) {
+      const expectedModels = scenario.explain ? [scenario.side, scenario.fallback.model, scenario.side, scenario.fallback.model] : scenario.primaryThrow || scenario.primaryError ? [scenario.side, scenario.fallback.model] : [scenario.side];
+      assert.deepEqual(sideRoutes.map(route => route.payload.model), expectedModels);
+      assert.deepEqual(sideRoutes.map(route => route.isFallback), expectedModels.map(model => model === scenario.fallback.model));
+      for (const route of sideRoutes) {
+        assert.equal(route.url.includes(`/${route.isFallback ? scenario.fallback.provider : scenario.sideProvider ?? scenario.provider}/v1/`), true, route.url);
+        assert.equal(effort(route.payload), route.isFallback && scenario.reconfigureAfterDetect && route.explaining ? 'medium' : route.isFallback ? scenario.fallback.thinking : scenario.thinking);
+      }
+    } else {
+      for (const [index, payload] of sidePayloads.entries()) {
+        assert.equal(payload.model, scenario.side);
+        assert.equal(effort(payload), scenario.thinkingByRequest?.[index] ?? scenario.thinking);
+      }
     }
     if (scenario.explain) {
-      assert.equal(sidePayloads.length, 2, 'detection and explanation both use the configured provider request');
+      assert.equal(sidePayloads.length, scenario.fallback ? 4 : 2, 'detection and explanation use the configured provider request(s)');
       assert.ok(['learn:', 'tag:', 'evidence:', 'explain:'].every(label => sideRequestTexts[0].includes(label)));
     }
     if (scenario.name.startsWith('other Claude')) {
@@ -166,10 +196,37 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     } else {
       assert.equal(sidePayload.tool_choice?.type ?? sidePayload.tool_choice, 'none');
     }
+    const noticesShown = notices.filter(n => n.startsWith('[ysk:')).length;
     if (scenario.error) {
       assert.match(check.error, /fixture rejection/);
-      assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
-    } else assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 1);
+      assert.equal(noticesShown, 0);
+    } else if (scenario.fallbackError) {
+      assert.match(check.error, /fixture fallback rejection/);
+      assert.equal(noticesShown, 0);
+    } else if (scenario.none) assert.equal(noticesShown, 0);
+    else assert.equal(noticesShown, 1);
+    if (scenario.fallback) {
+      const entries = readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      const triggered = entries.filter(entry => entry.event === 'ysk_fallback_triggered');
+      assert.equal(triggered.length, (scenario.explain ? 2 : scenario.primaryThrow || scenario.primaryError ? 1 : 0) + (scenario.fallbackError ? 0 : 0));
+      if (scenario.primaryError || scenario.primaryThrow || scenario.fallbackError) {
+        assert.equal(triggered[0].reason, scenario.primaryThrow ? 'request_error' : 'response_error');
+        assert.equal(triggered[0].primaryProvider, scenario.provider);
+        assert.equal(triggered[0].primaryModel, scenario.side);
+        assert.equal(triggered[0].fallbackProvider, scenario.fallback.provider);
+        assert.equal(triggered[0].fallbackModel, scenario.fallback.model);
+      }
+      if (scenario.explain) {
+        assert.equal(check.fallbackUsed, true);
+        assert.equal(check.fallbackReason, 'response_error');
+        assert.equal(check.primaryUsage, undefined);
+        assert.ok(check.fallbackUsage, 'fallback response usage is retained');
+        assert.equal(check.provider, scenario.fallback.provider);
+        assert.equal(check.model, scenario.fallback.model);
+        assert.equal(check.responseOutcome, 'stop');
+      }
+      if (scenario.fallbackError) assert.equal(sideRoutes.length, 2, 'no additional request follows fallback failure');
+    }
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited; }
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
