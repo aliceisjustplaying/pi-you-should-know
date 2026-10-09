@@ -69,7 +69,7 @@ For example, a MiniMax primary with an OpenAI backup:
 }
 ```
 
-Fallback diagnostics are written to `~/.pi/agent/you-should-know/checks.jsonl` as `ysk_fallback_triggered` and `ysk_fallback_result`. `/ysk status` reports the configured fallback.
+Fallback diagnostics are written under the pi agent directory (`~/.pi/agent` by default) as `ysk_fallback_triggered` and `ysk_fallback_result`. `/ysk status` reports the configured fallback.
 
 ## Cost
 
