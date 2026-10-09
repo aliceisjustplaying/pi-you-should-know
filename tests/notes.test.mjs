@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import fs, { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerHooks, syncBuiltinESMExports } from 'node:module';
@@ -109,6 +109,8 @@ test('different Chinese notes keep distinct identities while repeats are suppres
 test('symbol-only notes never dedupe on an empty normalized identity', async () => {
   const directory = join(home, '.pi/agent/you-should-know');
   rmSync(directory, { recursive: true, force: true });
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, 'knowledge.jsonl'), JSON.stringify({ line: '🧨', known: true }) + '\n');
   const client = openDetection([
     'learn: 🎉\ntag: Heads up\nevidence: emoji\nexplain: Celebration note.',
     'learn: ⚠️\ntag: Heads up\nevidence: emoji\nexplain: Warning note.',
@@ -124,6 +126,7 @@ test('symbol-only notes never dedupe on an empty normalized identity', async () 
     assert.ok(delivered.some((message) => message.includes('⚠️')));
     const outcomes = readFileSync(join(directory, 'checks.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line).outcome);
     assert.deepEqual(outcomes, ['shown', 'shown', 'shown']);
+    assert.deepEqual(state().known, [], 'empty normalized feedback identities are not loaded as known matches');
   } finally { client.close(); }
 });
 
