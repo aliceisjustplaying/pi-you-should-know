@@ -91,14 +91,20 @@ type State = { enabled: boolean; seen: string[]; known: string[]; ignoredInARow:
 // Each feedback write is one append, so another Pi process cannot overwrite it
 // with an older in-memory snapshot. state.json remains the readable snapshot.
 function readKnowledge(legacy: string[]): string[] {
-	const known = new Map(legacy.map((line) => [norm(line), line]));
+	const known = new Map<string, string>();
+	for (const line of legacy) {
+		const key = norm(line);
+		if (key !== "") known.set(key, line);
+	}
 	if (existsSync(KNOWLEDGE_FILE)) for (const line of readFileSync(KNOWLEDGE_FILE, "utf8").split("\n")) {
 		if (!line.trim()) continue;
 		try {
 			const entry = JSON.parse(line);
 			if (typeof entry.line !== "string" || typeof entry.known !== "boolean") continue;
-			if (entry.known) known.set(norm(entry.line), entry.line);
-			else known.delete(norm(entry.line));
+			const key = norm(entry.line);
+			if (key === "") continue;
+			if (entry.known) known.set(key, entry.line);
+			else known.delete(key);
 		} catch { /* An interrupted final append is ignored. The next starts on a new line. */ }
 	}
 	return [...known.values()].slice(-HISTORY_MAX);
@@ -152,7 +158,10 @@ function parse(text: string): Parsed {
 	}
 	return { kind: "line", line, tag, evidence, explanation };
 }
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
+const norm = (s: string) => {
+	const n = s.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, " ").trim();
+	return /[\p{L}\p{N}]/u.test(n) ? n : "";
+};
 
 const textOf = (msg: { content: unknown }) =>
 	Array.isArray(msg.content)
@@ -188,14 +197,19 @@ export default function (pi: ExtensionAPI) {
 		const config = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
 		const route = family ? { ...defaultRoutes[family], ...config[family] } : undefined;
 		const override = process.env.YSK_MODEL?.trim();
-		if (!override && !route) return { model: ctx.model, thinking: undefined };
-		const requested = override || route?.model;
-		if (typeof requested !== "string" || !requested.includes("/")) throw new Error("YSK model must be provider/model-id");
-		const at = requested.indexOf("/");
-		const model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
-		if (!model) throw new Error(`YSK model not found: ${requested}`);
-		const thinking = route?.thinking;
-		if (thinking !== undefined && !thinkingLevels.includes(thinking)) throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
+		const requested = override || (config.model !== undefined ? config.model : route?.model);
+		let model = ctx.model;
+		if (requested !== undefined) {
+			if (typeof requested !== "string") throw new Error("YSK model must be provider/model-id");
+			const at = requested.indexOf("/");
+			if (at <= 0 || at === requested.length - 1) throw new Error("YSK model must be provider/model-id");
+			model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
+			if (!model) throw new Error(`YSK model not found: ${requested}`);
+		}
+		const thinking = config.thinking !== undefined ? config.thinking : route?.thinking;
+		if (thinking !== undefined && (typeof thinking !== "string" || !thinkingLevels.includes(thinking as typeof thinkingLevels[number]))) {
+			throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
+		}
 		return { model, thinking };
 	};
 
@@ -496,8 +510,9 @@ export default function (pi: ExtensionAPI) {
 				else if (!r.text) outcome = "empty";
 				else {
 					const p = parse(r.text);
+					const identity = p.kind === "line" ? norm(p.line) : "";
 					if (p.kind !== "line") outcome = p.kind;
-					else if ([...seen, ...known].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
+					else if (identity !== "" && [...seen, ...known].some((x) => norm(x) === identity)) outcome = "deduped";
 					else if (promptCounter !== askedAt) outcome = "stale";
 					else {
 						outcome = "shown";
