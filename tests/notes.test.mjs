@@ -106,6 +106,27 @@ test('different Chinese notes keep distinct identities while repeats are suppres
   } finally { client.close(); }
 });
 
+test('symbol-only notes never dedupe on an empty normalized identity', async () => {
+  const directory = join(home, '.pi/agent/you-should-know');
+  rmSync(directory, { recursive: true, force: true });
+  const client = openDetection([
+    'learn: 🎉\ntag: Heads up\nevidence: emoji\nexplain: Celebration note.',
+    'learn: ⚠️\ntag: Heads up\nevidence: emoji\nexplain: Warning note.',
+    'learn: 🎉\ntag: Heads up\nevidence: emoji\nexplain: Repeated celebration note.',
+  ]);
+  try {
+    await client.check(6);
+    await client.check(12);
+    await client.check(18);
+    const delivered = client.notices.filter((message) => message.includes('[ysk:'));
+    assert.equal(delivered.length, 3);
+    assert.ok(delivered.some((message) => message.includes('🎉')));
+    assert.ok(delivered.some((message) => message.includes('⚠️')));
+    const outcomes = readFileSync(join(directory, 'checks.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line).outcome);
+    assert.deepEqual(outcomes, ['shown', 'shown', 'shown']);
+  } finally { client.close(); }
+});
+
 test('RPC prompts count ignored notes and back off, but ysk commands do not', async () => {
   const client = open('backoff');
   for (let i = 0; i < 3; i++) await client.command('test');
