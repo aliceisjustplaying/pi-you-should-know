@@ -74,6 +74,8 @@ test('different Chinese notes keep distinct identities while repeats are suppres
     'learn: API超时会影响登录。\ntag: Heads up\nevidence: api\nexplain: 登录说明。',
     'learn: API密钥已过期。\ntag: Heads up\nevidence: api\nexplain: 密钥说明。',
     'learn: ＡＰＩ密钥已过期！\ntag: Heads up\nevidence: api\nexplain: 密钥说明。',
+    'learn: API key expired.\ntag: Heads up\nevidence: api\nexplain: The key is no longer valid.',
+    'learn: api-key expired!\ntag: Heads up\nevidence: api\nexplain: The key is no longer valid.',
   ]);
   try {
     await client.check(6);
@@ -82,13 +84,16 @@ test('different Chinese notes keep distinct identities while repeats are suppres
     await client.check(24);
     await client.check(30);
     await client.check(36);
-    assert.deepEqual(client.notices.filter((message) => message.includes('[ysk:')).length, 4);
+    await client.check(42);
+    await client.check(48);
+    assert.deepEqual(client.notices.filter((message) => message.includes('[ysk:')).length, 5);
     assert.ok(client.notices.some((message) => message.includes('测试没有运行。')));
     assert.ok(client.notices.some((message) => message.includes('部署目标是生产环境。')));
     assert.ok(client.notices.some((message) => message.includes('API超时会影响登录。')));
     assert.ok(client.notices.some((message) => message.includes('API密钥已过期。')));
+    assert.ok(client.notices.some((message) => message.includes('API key expired.')));
     const outcomes = readFileSync(join(directory, 'checks.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line).outcome);
-    assert.deepEqual(outcomes, ['shown', 'shown', 'deduped', 'shown', 'shown', 'deduped']);
+    assert.deepEqual(outcomes, ['shown', 'shown', 'deduped', 'shown', 'shown', 'deduped', 'shown', 'deduped']);
     const firstId = client.notices.find((message) => message.includes('[ysk:')).match(/\[ysk:([^\]]+)\]/)[1];
     await client.answer(`answer ${firstId} knew`);
     client.close();
