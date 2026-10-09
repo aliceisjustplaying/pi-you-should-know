@@ -15,6 +15,12 @@ const cases = [
   { name: 'GPT default', api: 'openai-codex-responses', provider: 'openai-codex', main: 'gpt-6-astra', side: 'gpt-6.1-sol', thinking: 'high' },
   { name: 'GPT configurable same-model thinking', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'medium', config: { gpt: { model: 'openai/gpt-6-astra', thinking: 'medium' } } },
   { name: 'GPT environment model override', api: 'openai-completions', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', override: 'openai/gpt-6-sol' },
+  { name: 'global config routes a GLM main model through OpenAI for detection and explanation', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6.1-sol', thinking: 'high', thinkingByRequest: ['high', 'medium'], config: { model: 'openai/gpt-6.1-sol', thinking: 'high' }, reconfigureAfterDetect: { model: 'openai/gpt-6.1-sol', thinking: 'medium' }, explain: true, checkStatus: true },
+  { name: 'environment model wins over global model but keeps global thinking', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6-astra', thinking: 'high', config: { model: 'openai/gpt-6.1-sol', thinking: 'high' }, override: 'openai/gpt-6-astra' },
+  { name: 'global model and thinking win over GPT family values', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'high', config: { model: 'openai/gpt-6-astra', thinking: 'high', gpt: { model: 'openai/gpt-6-sol', thinking: 'medium' } } },
+  { name: 'unknown global model fails without sending side request', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6.1-sol', config: { model: 'openai/not-registered' }, missing: true, missingModel: 'openai/not-registered' },
+  { name: 'invalid global model format fails without sending side request', api: 'openai-responses', provider: 'zai', main: 'glm-5', side: 'gpt-6.1-sol', config: { model: 'not-a-provider-qualified-id' }, invalidModel: true },
+  { name: 'invalid global thinking fails without sending side request', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6.1-sol', config: { model: 'openai/gpt-6.1-sol', thinking: 'ultra' }, invalidThinking: true },
   { name: 'Fable family default', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5-1', side: 'claude-opus-5-5', thinking: 'medium' },
   { name: 'Fable configurable model and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-fable-5', side: 'claude-sonnet-5', thinking: 'high', config: { fable: { model: 'anthropic/claude-sonnet-5', thinking: 'high' } } },
   { name: 'other Claude preserves cache and thinking', api: 'anthropic-messages', provider: 'anthropic', main: 'claude-sonnet-5', side: 'claude-sonnet-5', thinking: 'low' },
@@ -27,18 +33,27 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   const agentDir = join(root, 'agent');
   const logDir = join(agentDir, 'you-should-know');
   mkdirSync(logDir, { recursive: true });
-  if (scenario.config) writeFileSync(join(logDir, 'config.json'), JSON.stringify(scenario.config));
+  const configFile = join(logDir, 'config.json');
+  if (scenario.config) writeFileSync(configFile, JSON.stringify(scenario.config));
   const receipt = join(root, 'receipt.txt');
   writeFileSync(receipt, 'Local fixture.');
   let child, mainPayload, sidePayload, stderr = '';
+  const sidePayloads = [];
+  const sideRequestTexts = [];
+  const sideRequestUrls = [];
+  const mainRequestUrls = [];
   const notices = [];
+  let statusMessage = '';
   const server = createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
     const body = Buffer.concat(chunks);
     const payload = JSON.parse((request.headers['content-encoding'] === 'zstd' ? zstdDecompressSync(body) : body).toString());
     const messages = payload.input ?? payload.messages;
-    const side = JSON.stringify(messages).includes('These are the last suggestions offered');
-    if (side) sidePayload = payload; else mainPayload = payload;
+    const serializedMessages = JSON.stringify(messages);
+    const side = serializedMessages.includes('These are the last suggestions offered') || serializedMessages.includes('The person watching you work said yes to:');
+    const explaining = serializedMessages.includes('The person watching you work said yes to:');
+    if (side) { sidePayload = payload; sidePayloads.push(payload); sideRequestTexts.push(serializedMessages); sideRequestUrls.push(request.url); } else { mainPayload = payload; mainRequestUrls.push(request.url); }
+    if (side && !explaining && scenario.reconfigureAfterDetect) writeFileSync(configFile, JSON.stringify(scenario.reconfigureAfterDetect));
     if (side && scenario.error) {
       response.writeHead(400, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'fixture rejection: invalid request', type: 'invalid_request_error' } }));
@@ -47,7 +62,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const steps = messages.filter(m => m.role === 'tool' || m.type === 'function_call_output').length
       + messages.flatMap(m => Array.isArray(m.content) ? m.content : []).filter(c => c.type === 'tool_result').length;
     const tool = !side && steps < 7;
-    const text = side ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.' : 'Done.';
+    const text = !side ? 'Done.' : explaining ? 'The fixture explanation uses the selected side model.' : scenario.explain ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt' : 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.';
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const event = (type, fields) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
     if (scenario.api === 'anthropic-messages') {
@@ -77,9 +92,18 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   server.on('upgrade', (_request, socket) => { socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); });
   try {
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
-    const key = scenario.api === 'openai-codex-responses' ? `fixture.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'local-fixture' } })).toString('base64url')}.fixture` : 'local-only';
-    const models = [...new Set([scenario.main, scenario.side])].map(id => ({ id, contextWindow: 128000, maxTokens: 16384, reasoning: true, compat: scenario.api === 'anthropic-messages' ? { forceAdaptiveThinking: true, supportsMidConvoEffort: id === 'claude-opus-5-5', supportsMidConvoSystemMessages: true } : undefined }));
-    writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers: { [scenario.provider]: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: scenario.api, apiKey: key, models } } }));
+    const keyFor = api => api === 'openai-codex-responses' ? `fixture.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'local-fixture' } })).toString('base64url')}.fixture` : 'local-only';
+    const mainProvider = scenario.provider;
+    const sideProvider = scenario.sideProvider ?? scenario.provider;
+    const apiFor = provider => provider === mainProvider ? scenario.api : (scenario.sideApi ?? scenario.api);
+    const providers = {};
+    for (const provider of new Set([mainProvider, sideProvider])) {
+      const api = apiFor(provider);
+      const ids = [...new Set([...(provider === mainProvider ? [scenario.main] : []), ...(provider === sideProvider ? [scenario.side] : [])])];
+      const models = ids.map(id => ({ id, contextWindow: 128000, maxTokens: 16384, reasoning: true, compat: api === 'anthropic-messages' ? { forceAdaptiveThinking: true, supportsMidConvoEffort: id === 'claude-opus-5-5', supportsMidConvoSystemMessages: true } : undefined }));
+      providers[provider] = { baseUrl: `http://127.0.0.1:${server.address().port}/${provider}/v1`, api, apiKey: keyFor(api), models };
+    }
+    writeFileSync(join(agentDir, 'models.json'), JSON.stringify({ providers }));
     const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, YSK_DEBUG: '1' };
     delete env.PI_SUBAGENT_ACTIVITY_FILE; delete env.YSK_MODEL;
     if (scenario.override) env.YSK_MODEL = scenario.override;
@@ -97,24 +121,44 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
           let event; try { event = JSON.parse(line); } catch { continue; }
           if (event.method === 'notify') {
             notices.push(event.message);
+            if (scenario.checkStatus && event.message.startsWith('You should know: on')) {
+              statusMessage = event.message;
+              child.stdin.write(JSON.stringify({ type: 'prompt', message: 'Read receipt.txt seven times, then finish.' }) + '\n');
+            }
             if (event.message.startsWith('you-should-know: step 6 ')) resolve(JSON.parse(readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim()));
           }
           if (event.type === 'extension_error' || event.type === 'response' && !event.success) reject(new Error(JSON.stringify(event)));
         }
       });
-      child.stdin.write(JSON.stringify({ type: 'prompt', message: 'Read receipt.txt seven times, then finish.' }) + '\n');
+      child.stdin.write(JSON.stringify({ type: 'prompt', message: scenario.checkStatus ? '/ysk status' : 'Read receipt.txt seven times, then finish.' }) + '\n');
     });
-    assert.equal(check.outcome, scenario.error || scenario.missing ? 'error' : 'shown', JSON.stringify(check));
+    assert.equal(check.outcome, scenario.error || scenario.missing || scenario.invalidModel || scenario.invalidThinking ? 'error' : 'shown', JSON.stringify(check));
+    if (scenario.invalidModel || scenario.invalidThinking) {
+      assert.match(check.error, scenario.invalidModel ? /YSK model must be provider\/model-id/ : /Invalid YSK thinking level/);
+      assert.equal(sidePayload, undefined);
+      assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
+      return;
+    }
     if (scenario.missing) {
-      assert.match(check.error, /YSK model not found: openai\/not-a-registered-model/);
+      assert.ok(check.error.includes(`YSK model not found: ${scenario.missingModel ?? 'openai/not-a-registered-model'}`), check.error);
       assert.equal(sidePayload, undefined);
       assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
       return;
     }
     assert.equal(sidePayload.model, scenario.side);
+    if (scenario.checkStatus) assert.match(statusMessage, /model openai\/gpt-6\.1-sol · thinking high/);
+    assert.ok(mainRequestUrls.every(url => url.includes(`/${scenario.provider}/v1/`)), JSON.stringify(mainRequestUrls));
+    assert.ok(sideRequestUrls.every(url => url.includes(`/${scenario.sideProvider ?? scenario.provider}/v1/`)), JSON.stringify(sideRequestUrls));
     const effort = p => p.reasoning?.effort ?? p.reasoning_effort ?? p.messages?.findLast(m => m.output_config)?.output_config.effort ?? p.output_config?.effort;
     assert.equal(effort(mainPayload), 'low');
-    assert.equal(effort(sidePayload), scenario.thinking);
+    for (const [index, payload] of sidePayloads.entries()) {
+      assert.equal(payload.model, scenario.side);
+      assert.equal(effort(payload), scenario.thinkingByRequest?.[index] ?? scenario.thinking);
+    }
+    if (scenario.explain) {
+      assert.equal(sidePayloads.length, 2, 'detection and explanation both use the configured provider request');
+      assert.ok(['learn:', 'tag:', 'evidence:', 'explain:'].every(label => sideRequestTexts[0].includes(label)));
+    }
     if (scenario.name.startsWith('other Claude')) {
       assert.deepEqual(sidePayload.tools, mainPayload.tools);
       assert.deepEqual(sidePayload.system, mainPayload.system);
