@@ -27,13 +27,24 @@ When the extension runs inside a [pi-herdr-subagents](https://github.com/aliceis
 
 ## Side models
 
-YSK uses these defaults, independently of the main agent's thinking level:
+Optional top-level `model` and `thinking` keys in `~/.pi/agent/you-should-know/config.json` (or under `PI_CODING_AGENT_DIR`) set a general side model, independently of the main model family:
+
+```json
+{
+  "model": "openai/gpt-6.1-sol",
+  "thinking": "high"
+}
+```
+
+Model selection priority is `YSK_MODEL` → top-level `model` → family route → the main model. `YSK_MODEL` changes only the model; it does not override thinking. Thinking uses the top-level `thinking` key when set, otherwise the family thinking default.
+
+If no general model is set, YSK uses these family defaults, independently of the main agent's thinking level:
 
 - GPT models → `openai-codex/gpt-6.1-sol`, high thinking.
 - Claude Fable models (including versioned variants) → `anthropic/claude-opus-5-5`, medium thinking.
 - Other models → the main model. Other Claude models keep their existing same-model request behavior.
 
-Both family routes are configurable in `~/.pi/agent/you-should-know/config.json` (under `PI_CODING_AGENT_DIR` when set):
+Family routes remain configurable in that same file:
 
 ```json
 {
@@ -42,9 +53,23 @@ Both family routes are configurable in `~/.pi/agent/you-should-know/config.json`
 }
 ```
 
-Each model value is a registered `provider/model-id`, using that provider's credentials. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. Missing fields use the defaults above. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
+Each model value is a registered `provider/model-id`, using that provider's credentials. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. Missing fields use the defaults above. Invalid model configuration or unknown IDs fail the check rather than silently using the main model. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
 
-The existing `YSK_MODEL` environment variable overrides the model for any family, including other Claude models. It does not override the GPT/Fable thinking setting. Unknown model IDs fail the check rather than silently using the main model.
+### Fallback
+
+An optional `fallback` object in the same file names a one-shot backup model. It runs only when the primary side request errors or throws. A successful primary response, `learn: none`, an unparseable answer, or an abort does not trigger it. The primary request is not retried. If both primary and fallback fail, the check is recorded as an error.
+
+For example, a MiniMax primary with an OpenAI backup:
+
+```json
+{
+  "model": "minimax-cn/MiniMax-M3.1-Flash-Preview",
+  "thinking": "off",
+  "fallback": { "model": "openai/gpt-6-luna", "thinking": "off" }
+}
+```
+
+Fallback diagnostics are written under the pi agent directory (`~/.pi/agent` by default) as `ysk_fallback_triggered` and `ysk_fallback_result`. `/ysk status` reports the configured fallback.
 
 ## Cost
 
