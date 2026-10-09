@@ -599,7 +599,13 @@ export default function (pi: ExtensionAPI) {
 							// In a herdr subagent: hand the note to the parent instead of showing it here.
 							// The parent can't fork our conversation, so write the explanation now.
 							let explanation = p.explanation;
-							if (!explanation) explanation = (await forkText(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)) || undefined;
+							if (!explanation) {
+								try {
+									explanation = (await forkText(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)) || undefined;
+								} catch (err) {
+									log({ event: "explain_prefetch_failed", error: String(err) });
+								}
+							}
 							relayToParent({ line: p.line, tag: p.tag, evidence: p.evidence, explanation, from: CHILD_NAME });
 							outcome = "relayed";
 							return;
@@ -607,7 +613,11 @@ export default function (pi: ExtensionAPI) {
 						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 };
 						if (ctx.mode !== "tui" && !note.explanation) {
 							// The client's "Explain" has nothing to ask, so write the explanation now.
-							note.explanation = (await forkText(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)) || undefined;
+							try {
+								note.explanation = (await forkText(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)) || undefined;
+							} catch (err) {
+								log({ event: "explain_prefetch_failed", error: String(err) });
+							}
 						}
 						notes.push(note);
 						while (ctx.mode === "tui" && notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
