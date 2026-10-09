@@ -33,6 +33,7 @@ const cases = [
   { name: 'learn none does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', none: true },
   { name: 'noncompliant model output does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', malformed: true },
   { name: 'abort does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', abortInFlight: true },
+  { name: 'abort during fallback does not log a request_error result', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true, abortDuringFallback: true },
   { name: 'unregistered fallback fails fast without a side request', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/not-registered', thinking: 'off' } }, invalidFallback: true },
   { name: 'invalid fallback thinking fails fast without a side request', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'impossible' } }, invalidFallbackThinking: true },
   { name: 'both primary and fallback errors remain visible and do not retry', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true, fallbackError: true },
@@ -56,7 +57,9 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   const notices = [];
   let statusMessage = '';
   let signalPrimaryRequest;
+  let signalFallbackRequest;
   const primaryRequestSeen = new Promise(resolve => { signalPrimaryRequest = resolve; });
+  const fallbackRequestSeen = new Promise(resolve => { signalFallbackRequest = resolve; });
   const server = createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
     const body = Buffer.concat(chunks);
@@ -81,6 +84,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       response.end(JSON.stringify({ error: { message: 'fixture fallback rejection', type: 'invalid_request_error' } }));
       return;
     }
+    if (side && isFallback && scenario.abortDuringFallback) { signalFallbackRequest(); return; }
     const steps = messages.filter(m => m.role === 'tool' || m.type === 'function_call_output').length
       + messages.flatMap(m => Array.isArray(m.content) ? m.content : []).filter(c => c.type === 'tool_result').length;
     const tool = !side && steps < 7;
@@ -134,7 +138,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const checkPromise = new Promise((resolve, reject) => {
       child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-skills', '--no-context-files', '--no-extensions', '-e', process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url)), '--provider', scenario.provider, '--model', scenario.main, '--thinking', 'low', '--session', join(root, 'session.jsonl')], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], signal: AbortSignal.timeout(18_000) });
       child.on('error', reject);
-      child.on('exit', () => { if (!scenario.abortInFlight) reject(new Error(`Pi exited before check: ${stderr}`)); });
+      child.on('exit', () => { if (!scenario.abortInFlight && !scenario.abortDuringFallback) reject(new Error(`Pi exited before check: ${stderr}`)); });
       child.stderr.on('data', data => { stderr += data; });
       let buffer = '';
       child.stdout.on('data', data => {
@@ -165,6 +169,16 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       assert.equal(sideRoutes[0].isFallback, false);
       const entries = readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
       assert.equal(entries.some(entry => entry.event === 'ysk_fallback_triggered'), false);
+      return;
+    }
+    if (scenario.abortDuringFallback) {
+      await fallbackRequestSeen;
+      child.stdin.write(JSON.stringify({ id: 'abort-check', type: 'new_session' }) + '\n');
+      const check = await checkPromise;
+      assert.equal(check.outcome, 'aborted', JSON.stringify(check));
+      const entries = readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      assert.ok(entries.some(entry => entry.event === 'ysk_fallback_triggered'));
+      assert.equal(entries.some(entry => entry.event === 'ysk_fallback_result' && entry.responseOutcome === 'request_error'), false);
       return;
     }
     const check = await checkPromise;

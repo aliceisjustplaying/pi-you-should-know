@@ -312,6 +312,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				result = await call(fallback.model, fallback.thinking);
 			} catch (error) {
+				if (signal.aborted) throw error;
 				log({
 					event: "ysk_fallback_result", reason, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
 					responseOutcome: "request_error", provider: fallbackProvider, model: fallbackModel,
