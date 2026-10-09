@@ -55,6 +55,22 @@ Family routes remain configurable in that same file:
 
 Each model value is a registered `provider/model-id`, using that provider's credentials. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. Missing fields use the defaults above. Invalid model configuration or unknown IDs fail the check rather than silently using the main model. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
 
+### Fallback
+
+An optional `fallback` object in the same file names a one-shot backup model. It runs only when the primary side request errors or throws. A successful primary response, `learn: none`, an unparseable answer, or an abort does not trigger it. The primary request is not retried. If both primary and fallback fail, the check is recorded as an error.
+
+For example, a MiniMax primary with an OpenAI backup:
+
+```json
+{
+  "model": "minimax-cn/MiniMax-M3.1-Flash-Preview",
+  "thinking": "off",
+  "fallback": { "model": "openai/gpt-6-luna", "thinking": "off" }
+}
+```
+
+Fallback diagnostics are written to `~/.pi/agent/you-should-know/checks.jsonl` as `ysk_fallback_triggered` and `ysk_fallback_result`. `/ysk status` reports the configured fallback.
+
 ## Cost
 
 Same-model Claude checks reuse the main request's cached prefix. A different side model still receives the conversation, but can cost more because that cache reuse is not guaranteed. Every check is logged, with token usage, to `~/.pi/agent/you-should-know/checks.jsonl`.
