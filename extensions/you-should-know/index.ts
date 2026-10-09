@@ -324,6 +324,7 @@ export default function (pi: ExtensionAPI) {
 				event: "ysk_fallback_result", reason, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
 				responseOutcome: result.stopReason, provider: result.provider, model: result.model,
 				primaryUsage: primary?.usage, fallbackUsage: result.usage,
+				...(result.stopReason === "error" ? { error: result.error } : {}),
 			});
 			return {
 				...result, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
@@ -576,7 +577,7 @@ export default function (pi: ExtensionAPI) {
 				extra = {
 					usage: r.usage, primaryUsage: r.primaryUsage, fallbackUsage: r.fallbackUsage,
 					stopReason: r.stopReason, responseOutcome: r.responseOutcome,
-					error: r.fallbackUsed && r.stopReason === "error" ? "YSK fallback response failed" : r.error,
+					error: r.error,
 					provider: r.provider, model: r.model, thinking: r.thinking,
 					primaryProvider: r.primaryProvider, primaryModel: r.primaryModel,
 					fallbackProvider: r.fallbackProvider, fallbackModel: r.fallbackModel,

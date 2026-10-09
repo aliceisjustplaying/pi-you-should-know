@@ -240,7 +240,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       assert.match(check.error, /fixture rejection/);
       assert.equal(noticesShown, 0);
     } else if (scenario.fallbackError) {
-      assert.match(check.error, /YSK fallback response failed/);
+      assert.match(check.error, /fixture fallback rejection/);
       assert.equal(noticesShown, 0);
     } else if (scenario.none || scenario.malformed) assert.equal(noticesShown, 0);
     else assert.equal(noticesShown, 1);
@@ -265,7 +265,11 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
         assert.equal(check.model, scenario.fallback.model);
         assert.equal(check.responseOutcome, 'stop');
       }
-      if (scenario.fallbackError) assert.equal(sideRoutes.length, 2, 'no additional request follows fallback failure');
+      if (scenario.fallbackError) {
+        assert.equal(sideRoutes.length, 2, 'no additional request follows fallback failure');
+        const fallbackResult = entries.find(entry => entry.event === 'ysk_fallback_result');
+        assert.match(fallbackResult.error, /fixture fallback rejection/);
+      }
       if (!scenario.primaryError && !scenario.primaryThrow) assert.equal(check.fallbackUsed, false);
     }
   } finally {
