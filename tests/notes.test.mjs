@@ -135,6 +135,39 @@ test('symbol-only notes never dedupe on an empty normalized identity', async () 
   } finally { client.close(); }
 });
 
+test('emoji notes with variation selectors do not share a mark-only identity', async () => {
+  const directory = join(home, '.pi/agent/you-should-know');
+  rmSync(directory, { recursive: true, force: true });
+  const client = openDetection([
+    'learn: ❤️\ntag: Heads up\nevidence: emoji\nexplain: Heart note.',
+    'learn: ⚠️\ntag: Heads up\nevidence: emoji\nexplain: Warning note.',
+  ]);
+  try {
+    await client.check(6);
+    await client.check(12);
+    const delivered = client.notices.filter((message) => message.includes('[ysk:'));
+    assert.equal(delivered.length, 2);
+    assert.ok(delivered.some((message) => message.includes('❤️')));
+    assert.ok(delivered.some((message) => message.includes('⚠️')));
+    const outcomes = readFileSync(join(directory, 'checks.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line).outcome);
+    assert.deepEqual(outcomes, ['shown', 'shown']);
+    const heartId = delivered.find((message) => message.includes('❤️')).match(/\[ysk:([^\]]+)\]/)[1];
+    await client.answer(`answer ${heartId} knew`);
+    client.close();
+    const stateFile = join(directory, 'state.json');
+    const saved = JSON.parse(readFileSync(stateFile, 'utf8'));
+    saved.seen = [];
+    writeFileSync(stateFile, JSON.stringify(saved));
+    writeFileSync(join(directory, 'checks.jsonl'), '');
+    const warningClient = openDetection(['learn: ⚠️\ntag: Heads up\nevidence: emoji\nexplain: Warning note.']);
+    try {
+      await warningClient.check(6);
+      assert.ok(warningClient.notices.some((message) => message.includes('⚠️')));
+      assert.equal(JSON.parse(readFileSync(join(directory, 'checks.jsonl'), 'utf8').trim()).outcome, 'shown');
+    } finally { warningClient.close(); }
+  } finally { client.close(); }
+});
+
 test('RPC prompts count ignored notes and back off, but ysk commands do not', async () => {
   const client = open('backoff');
   for (let i = 0; i < 3; i++) await client.command('test');
