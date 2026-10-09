@@ -18,6 +18,7 @@ const cases = [
   { name: 'global config routes a GLM main model through OpenAI for detection and explanation', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6.1-sol', thinking: 'high', thinkingByRequest: ['high', 'medium'], config: { model: 'openai/gpt-6.1-sol', thinking: 'high' }, reconfigureAfterDetect: { model: 'openai/gpt-6.1-sol', thinking: 'medium' }, explain: true, checkStatus: true },
   { name: 'environment model wins over global model but keeps global thinking', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6-astra', thinking: 'high', config: { model: 'openai/gpt-6.1-sol', thinking: 'high' }, override: 'openai/gpt-6-astra' },
   { name: 'global model and thinking win over GPT family values', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-astra', thinking: 'high', config: { model: 'openai/gpt-6-astra', thinking: 'high', gpt: { model: 'openai/gpt-6-sol', thinking: 'medium' } } },
+  { name: 'fallback thinking off is not overwritten by GPT family thinking high', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6.1-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6.1-sol', thinking: 'high' }, fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true },
   { name: 'unknown global model fails without sending side request', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6.1-sol', config: { model: 'openai/not-registered' }, missing: true, missingModel: 'openai/not-registered' },
   { name: 'invalid global model format fails without sending side request', api: 'openai-responses', provider: 'zai', main: 'glm-5', side: 'gpt-6.1-sol', config: { model: 'not-a-provider-qualified-id' }, invalidModel: true },
   { name: 'invalid global thinking fails without sending side request', api: 'openai-responses', provider: 'zai', sideProvider: 'openai', main: 'glm-5', side: 'gpt-6.1-sol', config: { model: 'openai/gpt-6.1-sol', thinking: 'ultra' }, invalidThinking: true },
@@ -27,9 +28,13 @@ const cases = [
   { name: 'unknown configured model does not fall back to main', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', config: { gpt: { model: 'openai/not-a-registered-model' } }, missing: true },
   { name: 'GPT provider error is not an empty answer', api: 'openai-responses', provider: 'openai', main: 'gpt-6-astra', side: 'gpt-6-sol', thinking: 'high', config: { gpt: { model: 'openai/gpt-6-sol' } }, error: true },
   { name: 'MiniMax failure uses GPT Luna once for detection and explanation', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true, explain: true, checkStatus: true, reconfigureAfterDetect: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'medium' } } },
-  { name: 'MiniMax thrown request error uses GPT Luna once', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryThrow: true },
+  { name: 'MiniMax transport disconnect uses GPT Luna once', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryThrow: true },
+  { name: 'primary success does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses' },
   { name: 'learn none does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', thinking: 'off', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', none: true },
+  { name: 'noncompliant model output does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', thinking: 'off', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', malformed: true },
+  { name: 'abort does not call configured fallback', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', abortInFlight: true },
   { name: 'unregistered fallback fails fast without a side request', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/not-registered', thinking: 'off' } }, invalidFallback: true },
+  { name: 'invalid fallback thinking fails fast without a side request', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'impossible' } }, invalidFallbackThinking: true },
   { name: 'both primary and fallback errors remain visible and do not retry', api: 'openai-completions', provider: 'minimax-cn', main: 'MiniMax-M3.1-Flash-Preview', side: 'MiniMax-M3.1-Flash-Preview', config: { model: 'minimax-cn/MiniMax-M3.1-Flash-Preview', fallback: { model: 'openai/gpt-6-luna', thinking: 'off' } }, fallback: { provider: 'openai', model: 'gpt-6-luna', thinking: 'off' }, fallbackApi: 'openai-responses', primaryError: true, fallbackError: true },
 ];
 
@@ -50,6 +55,8 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
   const mainRequestUrls = [];
   const notices = [];
   let statusMessage = '';
+  let signalPrimaryRequest;
+  const primaryRequestSeen = new Promise(resolve => { signalPrimaryRequest = resolve; });
   const server = createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
     const body = Buffer.concat(chunks);
@@ -68,6 +75,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       return;
     }
     if (side && !isFallback && scenario.primaryThrow) { request.socket.destroy(); return; }
+    if (side && !isFallback && scenario.abortInFlight) { signalPrimaryRequest(); return; }
     if (side && isFallback && scenario.fallbackError) {
       response.writeHead(400, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'fixture fallback rejection', type: 'invalid_request_error' } }));
@@ -76,7 +84,7 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const steps = messages.filter(m => m.role === 'tool' || m.type === 'function_call_output').length
       + messages.flatMap(m => Array.isArray(m.content) ? m.content : []).filter(c => c.type === 'tool_result').length;
     const tool = !side && steps < 7;
-    const text = !side ? 'Done.' : explaining ? 'The fixture explanation uses the selected side model.' : scenario.none ? 'learn: none' : scenario.explain ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt' : 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.';
+    const text = !side ? 'Done.' : explaining ? 'The fixture explanation uses the selected side model.' : scenario.none ? 'learn: none' : scenario.malformed ? 'no parseable response' : scenario.explain ? 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt' : 'learn: The fixture found a billing change.\ntag: Heads up\nevidence: receipt.txt\nexplain: The price changed.';
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const event = (type, fields) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
     const requestApi = provider === scenario.provider ? scenario.api : provider === (scenario.sideProvider ?? scenario.provider) ? (scenario.sideApi ?? scenario.api) : scenario.fallbackApi;
@@ -123,10 +131,10 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
     const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, YSK_DEBUG: '1' };
     delete env.PI_SUBAGENT_ACTIVITY_FILE; delete env.YSK_MODEL;
     if (scenario.override) env.YSK_MODEL = scenario.override;
-    const check = await new Promise((resolve, reject) => {
+    const checkPromise = new Promise((resolve, reject) => {
       child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-skills', '--no-context-files', '--no-extensions', '-e', process.env.YSK_TEST_SOURCE ?? fileURLToPath(new URL('../extensions/you-should-know/index.ts', import.meta.url)), '--provider', scenario.provider, '--model', scenario.main, '--thinking', 'low', '--session', join(root, 'session.jsonl')], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], signal: AbortSignal.timeout(18_000) });
       child.on('error', reject);
-      child.on('exit', () => reject(new Error(`Pi exited before check: ${stderr}`)));
+      child.on('exit', () => { if (!scenario.abortInFlight) reject(new Error(`Pi exited before check: ${stderr}`)); });
       child.stderr.on('data', data => { stderr += data; });
       let buffer = '';
       child.stdout.on('data', data => {
@@ -148,9 +156,21 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       });
       child.stdin.write(JSON.stringify({ type: 'prompt', message: scenario.checkStatus ? '/ysk status' : 'Read receipt.txt seven times, then finish.' }) + '\n');
     });
-    assert.equal(check.outcome, scenario.error || scenario.missing || scenario.invalidModel || scenario.invalidThinking || scenario.invalidFallback || scenario.fallbackError ? 'error' : scenario.none ? 'none' : 'shown', JSON.stringify(check));
-    if (scenario.invalidModel || scenario.invalidThinking || scenario.invalidFallback) {
-      assert.match(check.error, scenario.invalidModel ? /YSK model must be provider\/model-id/ : scenario.invalidFallback ? /YSK fallback model not found: openai\/not-registered/ : /Invalid YSK thinking level/);
+    if (scenario.abortInFlight) {
+      await primaryRequestSeen;
+      child.stdin.write(JSON.stringify({ id: 'abort-check', type: 'new_session' }) + '\n');
+      const check = await checkPromise;
+      assert.equal(check.outcome, 'aborted', JSON.stringify(check));
+      assert.equal(sideRoutes.length, 1, 'the pending primary request is the only provider call');
+      assert.equal(sideRoutes[0].isFallback, false);
+      const entries = readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      assert.equal(entries.some(entry => entry.event === 'ysk_fallback_triggered'), false);
+      return;
+    }
+    const check = await checkPromise;
+    assert.equal(check.outcome, scenario.error || scenario.missing || scenario.invalidModel || scenario.invalidThinking || scenario.invalidFallback || scenario.invalidFallbackThinking || scenario.fallbackError ? 'error' : scenario.none ? 'none' : scenario.malformed ? 'parse_failed' : 'shown', JSON.stringify(check));
+    if (scenario.invalidModel || scenario.invalidThinking || scenario.invalidFallback || scenario.invalidFallbackThinking) {
+      assert.match(check.error, scenario.invalidModel ? /YSK model must be provider\/model-id/ : scenario.invalidFallback ? /YSK fallback model not found: openai\/not-registered/ : scenario.invalidFallbackThinking ? /Invalid YSK fallback thinking level/ : /Invalid YSK thinking level/);
       assert.equal(sidePayload, undefined);
       assert.equal(notices.filter(n => n.startsWith('[ysk:')).length, 0);
       return;
@@ -175,9 +195,14 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       const expectedModels = scenario.explain ? [scenario.side, scenario.fallback.model, scenario.side, scenario.fallback.model] : scenario.primaryThrow || scenario.primaryError ? [scenario.side, scenario.fallback.model] : [scenario.side];
       assert.deepEqual(sideRoutes.map(route => route.payload.model), expectedModels);
       assert.deepEqual(sideRoutes.map(route => route.isFallback), expectedModels.map(model => model === scenario.fallback.model));
+      assert.ok(sideRoutes.every(route => JSON.stringify(route.payload.input ?? route.payload.messages).includes('Read receipt.txt seven times, then finish.')));
       for (const route of sideRoutes) {
         assert.equal(route.url.includes(`/${route.isFallback ? scenario.fallback.provider : scenario.sideProvider ?? scenario.provider}/v1/`), true, route.url);
-        assert.equal(effort(route.payload), route.isFallback && scenario.reconfigureAfterDetect && route.explaining ? 'medium' : route.isFallback ? scenario.fallback.thinking : scenario.thinking);
+        const expectedEffort = route.isFallback && scenario.reconfigureAfterDetect && route.explaining ? 'medium' : route.isFallback ? scenario.fallback.thinking : scenario.thinking;
+        const wireEffort = effort(route.payload);
+        const routeApi = route.isFallback ? scenario.fallbackApi : scenario.sideApi ?? scenario.api;
+        if (expectedEffort === 'off') assert.equal(wireEffort, routeApi === 'openai-responses' ? 'none' : undefined, `${route.provider}/${route.payload.model} via ${routeApi}`);
+        else assert.equal(wireEffort, expectedEffort, `${route.provider}/${route.payload.model} via ${routeApi}`);
       }
     } else {
       for (const [index, payload] of sidePayloads.entries()) {
@@ -201,16 +226,17 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       assert.match(check.error, /fixture rejection/);
       assert.equal(noticesShown, 0);
     } else if (scenario.fallbackError) {
-      assert.match(check.error, /fixture fallback rejection/);
+      assert.match(check.error, /YSK fallback response failed/);
       assert.equal(noticesShown, 0);
-    } else if (scenario.none) assert.equal(noticesShown, 0);
+    } else if (scenario.none || scenario.malformed) assert.equal(noticesShown, 0);
     else assert.equal(noticesShown, 1);
     if (scenario.fallback) {
       const entries = readFileSync(join(logDir, 'checks.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
       const triggered = entries.filter(entry => entry.event === 'ysk_fallback_triggered');
-      assert.equal(triggered.length, (scenario.explain ? 2 : scenario.primaryThrow || scenario.primaryError ? 1 : 0) + (scenario.fallbackError ? 0 : 0));
+      assert.equal(triggered.length, scenario.explain ? 2 : scenario.primaryThrow || scenario.primaryError ? 1 : 0);
+      assert.equal(JSON.stringify(entries).includes('Read receipt.txt seven times, then finish.'), false, 'logs do not contain the original prompt');
       if (scenario.primaryError || scenario.primaryThrow || scenario.fallbackError) {
-        assert.equal(triggered[0].reason, scenario.primaryThrow ? 'request_error' : 'response_error');
+        assert.equal(triggered[0].reason, 'response_error');
         assert.equal(triggered[0].primaryProvider, scenario.provider);
         assert.equal(triggered[0].primaryModel, scenario.side);
         assert.equal(triggered[0].fallbackProvider, scenario.fallback.provider);
@@ -219,13 +245,14 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       if (scenario.explain) {
         assert.equal(check.fallbackUsed, true);
         assert.equal(check.fallbackReason, 'response_error');
-        assert.equal(check.primaryUsage, undefined);
+        assert.ok(check.primaryUsage, 'failed primary usage is retained when Pi provides it');
         assert.ok(check.fallbackUsage, 'fallback response usage is retained');
         assert.equal(check.provider, scenario.fallback.provider);
         assert.equal(check.model, scenario.fallback.model);
         assert.equal(check.responseOutcome, 'stop');
       }
       if (scenario.fallbackError) assert.equal(sideRoutes.length, 2, 'no additional request follows fallback failure');
+      if (!scenario.primaryError && !scenario.primaryThrow) assert.equal(check.fallbackUsed, false);
     }
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited; }

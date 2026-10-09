@@ -196,21 +196,35 @@ export default function (pi: ExtensionAPI) {
 		const family = /^gpt-/i.test(id) ? "gpt" : /^claude-fable(?:-|$)/i.test(id) ? "fable" : undefined;
 		const config = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
 		const route = family ? { ...defaultRoutes[family], ...config[family] } : undefined;
+		const resolveModel = (requested: unknown, label: string) => {
+			const prefix = label ? `${label} ` : "";
+			if (typeof requested !== "string") throw new Error(`YSK ${prefix}model must be provider/model-id`);
+			const at = requested.indexOf("/");
+			if (at <= 0 || at === requested.length - 1) throw new Error(`YSK ${prefix}model must be provider/model-id`);
+			const model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
+			if (!model) throw new Error(`YSK ${prefix}model not found: ${requested}`);
+			return model;
+		};
+		const resolveThinking = (thinking: unknown, label: string) => {
+			const prefix = label ? `${label} ` : "";
+			if (thinking !== undefined && (typeof thinking !== "string" || !thinkingLevels.includes(thinking as typeof thinkingLevels[number]))) {
+				throw new Error(`Invalid YSK ${prefix}thinking level in ${CONFIG_FILE}`);
+			}
+			return thinking as typeof thinkingLevels[number] | undefined;
+		};
 		const override = process.env.YSK_MODEL?.trim();
 		const requested = override || (config.model !== undefined ? config.model : route?.model);
-		let model = ctx.model;
-		if (requested !== undefined) {
-			if (typeof requested !== "string") throw new Error("YSK model must be provider/model-id");
-			const at = requested.indexOf("/");
-			if (at <= 0 || at === requested.length - 1) throw new Error("YSK model must be provider/model-id");
-			model = ctx.modelRegistry.find(requested.slice(0, at), requested.slice(at + 1));
-			if (!model) throw new Error(`YSK model not found: ${requested}`);
+		const model = requested === undefined ? ctx.model : resolveModel(requested, "");
+		const thinking = resolveThinking(config.thinking !== undefined ? config.thinking : route?.thinking, "");
+		let fallback: { model: NonNullable<ReturnType<typeof resolveModel>>; thinking: typeof thinking } | undefined;
+		if (config.fallback !== undefined) {
+			if (!config.fallback || typeof config.fallback !== "object" || Array.isArray(config.fallback)) throw new Error("YSK fallback must be an object in " + CONFIG_FILE);
+			fallback = {
+				model: resolveModel(config.fallback.model, "fallback"),
+				thinking: resolveThinking(config.fallback.thinking, "fallback"),
+			};
 		}
-		const thinking = config.thinking !== undefined ? config.thinking : route?.thinking;
-		if (thinking !== undefined && (typeof thinking !== "string" || !thinkingLevels.includes(thinking as typeof thinkingLevels[number]))) {
-			throw new Error("Invalid YSK thinking level in " + CONFIG_FILE);
-		}
-		return { model, thinking };
+		return { model, thinking, fallback };
 	};
 
 	const notesFile = (ctx: ExtensionContext) =>
@@ -254,7 +268,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	async function fork(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
-		const { model, thinking } = pickModel(ctx);
+		const { model, thinking, fallback } = pickModel(ctx);
 		if (!model) throw new Error("no model");
 		const messages = [
 			...llmMessages,
@@ -262,22 +276,75 @@ export default function (pi: ExtensionAPI) {
 		];
 		const hasSystem = llmMessages[0]?.role === "system";
 		const context = { messages, ...(hasSystem ? {} : { systemPrompt: ctx.getSystemPrompt() }) } as any;
-		const options = {
-			signal, sessionId: ctx.sessionManager.getSessionId(),
-			onPayload: (p: unknown) => {
-				// Anthropic cache alignment must not overwrite a routed model's
-				// converted history or its independent thinking setting.
-				if (model.api === "anthropic-messages" && model.provider === ctx.model?.provider && model.id === ctx.model?.id && thinking === undefined) return alignWithMain(p);
-				lastAlign = { aligned: false, why: "independent side request" };
-				return undefined;
-			},
+		const call = async (target: typeof model, targetThinking: typeof thinking) => {
+			const options = {
+				signal, sessionId: ctx.sessionManager.getSessionId(),
+				onPayload: (p: unknown) => {
+					// Anthropic cache alignment must not overwrite a routed model's
+					// converted history or its independent thinking setting.
+					if (target.api === "anthropic-messages" && target.provider === ctx.model?.provider && target.id === ctx.model?.id && targetThinking === undefined) return alignWithMain(p);
+					lastAlign = { aligned: false, why: "independent side request" };
+					return undefined;
+				},
+			};
+			// Preserve the working same-model Claude path. Routes use Pi's neutral
+			// thinking option, translated by each provider to its native wire format.
+			const res = targetThinking === undefined && target.api === "anthropic-messages"
+				? await ctx.modelRegistry.complete(target, context, options)
+				: await ctx.modelRegistry.streamSimple(target, context, { ...options, reasoning: targetThinking, toolChoice: "none" }).result();
+			return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: target.provider, model: target.id, thinking: targetThinking };
 		};
-		// Preserve the working same-model Claude path. Routes use Pi's neutral
-		// thinking option, translated by each provider to its native wire format.
-		const res = thinking === undefined && model.api === "anthropic-messages"
-			? await ctx.modelRegistry.complete(model, context, options)
-			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking, toolChoice: "none" }).result();
-		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking };
+		const primaryProvider = model.provider;
+		const primaryModel = model.id;
+		const fallbackProvider = fallback?.model.provider;
+		const fallbackModel = fallback?.model.id;
+		const primaryResult = (result: Awaited<ReturnType<typeof call>>) => ({
+			...result, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
+			fallbackUsed: false, primaryUsage: result.usage, responseOutcome: result.stopReason,
+		});
+		if (!fallback) return primaryResult(await call(model, thinking));
+		const trigger = (reason: "response_error" | "request_error") => log({
+			event: "ysk_fallback_triggered", reason, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
+		});
+		const useFallback = async (reason: "response_error" | "request_error", primary?: Awaited<ReturnType<typeof call>>) => {
+			trigger(reason);
+			let result: Awaited<ReturnType<typeof call>>;
+			try {
+				result = await call(fallback.model, fallback.thinking);
+			} catch (error) {
+				log({
+					event: "ysk_fallback_result", reason, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
+					responseOutcome: "request_error", provider: fallbackProvider, model: fallbackModel,
+					primaryUsage: primary?.usage,
+				});
+				throw new Error("YSK fallback request failed", { cause: error });
+			}
+			log({
+				event: "ysk_fallback_result", reason, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
+				responseOutcome: result.stopReason, provider: result.provider, model: result.model,
+				primaryUsage: primary?.usage, fallbackUsage: result.usage,
+			});
+			return {
+				...result, primaryProvider, primaryModel, fallbackProvider, fallbackModel,
+				fallbackUsed: true, fallbackReason: reason, primaryResponseOutcome: primary?.stopReason ?? "request_error",
+				primaryUsage: primary?.usage, fallbackUsage: result.usage, responseOutcome: result.stopReason,
+			};
+		};
+		let primary: Awaited<ReturnType<typeof call>>;
+		try {
+			primary = await call(model, thinking);
+		} catch (error) {
+			if (signal.aborted) throw error;
+			return useFallback("request_error");
+		}
+		if (!signal.aborted && primary.stopReason === "error") return useFallback("response_error", primary);
+		return primaryResult(primary);
+	}
+
+	async function forkText(ctx: ExtensionContext, llmMessages: any[], prompt: string, signal: AbortSignal) {
+		const result = await fork(ctx, llmMessages, prompt, signal);
+		if (result.stopReason === "error") throw new Error("YSK model request failed (stopReason=error)");
+		return result.text;
 	}
 
 	let lastLlmMessages: any[] = [];
@@ -497,6 +564,7 @@ export default function (pi: ExtensionAPI) {
 		const seen = [...state.seen];
 		const known = [...state.known];
 		const t0 = Date.now();
+		const checkUi = ctx.ui;
 		checks++;
 		// Fire and forget: never block the main agent.
 		void (async () => {
@@ -504,7 +572,15 @@ export default function (pi: ExtensionAPI) {
 			let extra: Record<string, unknown> = {};
 			try {
 				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known), ac.signal);
-				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking };
+				extra = {
+					usage: r.usage, primaryUsage: r.primaryUsage, fallbackUsage: r.fallbackUsage,
+					stopReason: r.stopReason, responseOutcome: r.responseOutcome,
+					error: r.fallbackUsed && r.stopReason === "error" ? "YSK fallback response failed" : r.error,
+					provider: r.provider, model: r.model, thinking: r.thinking,
+					primaryProvider: r.primaryProvider, primaryModel: r.primaryModel,
+					fallbackProvider: r.fallbackProvider, fallbackModel: r.fallbackModel,
+					fallbackUsed: r.fallbackUsed, fallbackReason: r.fallbackReason,
+				};
 				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
 				else if (r.stopReason === "error") outcome = "error";
 				else if (!r.text) outcome = "empty";
@@ -523,11 +599,7 @@ export default function (pi: ExtensionAPI) {
 							// In a herdr subagent: hand the note to the parent instead of showing it here.
 							// The parent can't fork our conversation, so write the explanation now.
 							let explanation = p.explanation;
-							if (!explanation) {
-								try {
-									explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
-								} catch {}
-							}
+							if (!explanation) explanation = (await forkText(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)) || undefined;
 							relayToParent({ line: p.line, tag: p.tag, evidence: p.evidence, explanation, from: CHILD_NAME });
 							outcome = "relayed";
 							return;
@@ -535,9 +607,7 @@ export default function (pi: ExtensionAPI) {
 						const note: Note = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), line: p.line, tag: p.tag, evidence: p.evidence, explanation: p.explanation, shownAt: Date.now(), promptsSurvived: 0 };
 						if (ctx.mode !== "tui" && !note.explanation) {
 							// The client's "Explain" has nothing to ask, so write the explanation now.
-							try {
-								note.explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
-							} catch {}
+							note.explanation = (await forkText(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)) || undefined;
 						}
 						notes.push(note);
 						while (ctx.mode === "tui" && notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
@@ -551,7 +621,7 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				if (inFlight === ac) inFlight = undefined;
 				log({ event: "check", step, outcome, ms: Date.now() - t0, align: lastAlign, ...extra });
-				if (DEBUG) ctx.ui.notify(`you-should-know: step ${step} \u2192 ${outcome} (${Date.now() - t0}ms)`, "info");
+				if (DEBUG) checkUi.notify(`you-should-know: step ${step} \u2192 ${outcome} (${Date.now() - t0}ms)`, "info");
 			}
 		})();
 	});
@@ -560,7 +630,7 @@ export default function (pi: ExtensionAPI) {
 		let text = n.explanation;
 		if (!text) {
 			ctx.ui.notify("One moment\u2026", "info");
-			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
+			text = await forkText(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal);
 		}
 		while (true) {
 			const choice = ctx.mode !== "tui" ? await explainBySelect(ctx, n, text!) : await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
@@ -586,13 +656,13 @@ export default function (pi: ExtensionAPI) {
 			if (choice === "simpler_words" || choice === "less_detail" || choice === "more_detail") {
 				ctx.ui.notify("Rewriting\u2026", "info");
 				try {
-					const r = await fork(
+					const rewritten = await forkText(
 						ctx,
 						lastLlmMessages,
 						explainPrompt(n.line, { direction: choice, text: text! }),
 						new AbortController().signal,
 					);
-					if (r.text) text = r.text;
+					if (rewritten) text = rewritten;
 				} catch (err) {
 					ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error");
 				}
@@ -643,9 +713,12 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (arg === "status") {
-			const { model, thinking } = pickModel(ctx);
+			const { model, thinking, fallback } = pickModel(ctx);
+			const fallbackStatus = fallback
+				? ` \u00b7 fallback ${fallback.model.provider}/${fallback.model.id} \u00b7 thinking ${fallback.thinking ?? "model default"}`
+				: " \u00b7 fallback none";
 			ctx.ui.notify(
-				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${model?.provider ?? "?"}/${model?.id ?? "?"} \u00b7 thinking ${thinking ?? "main request"} \u00b7 config ${CONFIG_FILE} \u00b7 log ${LOG_FILE}`,
+				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${model?.provider ?? "?"}/${model?.id ?? "?"} \u00b7 thinking ${thinking ?? "main request"}${fallbackStatus} \u00b7 config ${CONFIG_FILE} \u00b7 log ${LOG_FILE}`,
 				"info",
 			);
 			return;
