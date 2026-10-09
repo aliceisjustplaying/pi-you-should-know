@@ -152,7 +152,7 @@ function parse(text: string): Parsed {
 	}
 	return { kind: "line", line, tag, evidence, explanation };
 }
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
+const norm = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, " ").trim(); // Co()
 
 const textOf = (msg: { content: unknown }) =>
 	Array.isArray(msg.content)
