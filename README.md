@@ -11,6 +11,7 @@ It's a port of the "you should know" plugin built into Claude Code.
 - A note shows up above the editor, like `✦ Heads up · The agent loosened the test threshold from 0.8 to 0.65.`
 - `/ysk` or alt+shift+y: open the top note. You can learn more about it, mark it as something you knew, send it to the agent or dismiss it.
 - alt+x: dismiss the top note.
+- `/ysk clear`: dismiss every open note at once.
 - `/ysk off`, `/ysk on`, `/ysk status`: turn it off and on, or see how many checks it has run.
 
 If you keep ignoring notes, it checks less often. Answering any note resets that.
@@ -45,6 +46,16 @@ Both family routes are configurable in `~/.pi/agent/you-should-know/config.json`
 Each model value is a registered `provider/model-id`, using that provider's credentials. Thinking accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, subject to the selected model's support. Missing fields use the defaults above. Changes apply to the next check or explanation; `/ysk status` shows the effective model, thinking and config path.
 
 The existing `YSK_MODEL` environment variable overrides the model for any family, including other Claude models. It does not override the GPT/Fable thinking setting. Unknown model IDs fail the check rather than silently using the main model.
+
+## Note language
+
+Optional `language` in the same `config.json`: `zh` or `en`.
+
+When set, detect and explain prompts require that language for the learn line and the explain text. Protocol labels (`learn:`, `tag:`, `evidence:`, `explain:`), tag values (`You should know`, `Heads up`), and sentinels (`learn: none`, `evidence: none`) stay in English and are never translated. After generation, a deterministic check runs on the learn line and explain text (not on evidence or tags). A mismatch is repaired once, without replaying the main conversation. A second mismatch discards the note: it is not shown and not sent as a notification, and `checks.jsonl` records `outcome: "language_rejected"` with a line summary. Mixed Chinese with English technical terms, code names, and issue numbers is valid for `zh`.
+
+When `language` is omitted, YSK follows the conversation: an explicit language request wins, otherwise the main language of the chat, and English only when there is no clear signal. Protocol elements still stay in English. There is no post-generation language check in this mode.
+
+Any other `language` value fails that check with `YSK language must be zh or en`. Widget prefixes, `/ysk` menus, and notify chrome stay in English.
 
 ## Cost
 

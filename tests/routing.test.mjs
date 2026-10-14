@@ -112,6 +112,10 @@ for (const scenario of cases) test(scenario.name, { timeout: 20_000 }, async () 
       return;
     }
     assert.equal(sidePayload.model, scenario.side);
+    const sideText = JSON.stringify(sidePayload.input ?? sidePayload.messages);
+    assert.match(sideText, /in the language the user is using in this conversation/);
+    assert.equal(sideText.includes('Write the learn line and the explain text in Simplified Chinese'), false);
+    assert.equal(sideText.includes('Write the learn line and the explain text in English.'), false);
     const effort = p => p.reasoning?.effort ?? p.reasoning_effort ?? p.messages?.findLast(m => m.output_config)?.output_config.effort ?? p.output_config?.effort;
     assert.equal(effort(mainPayload), 'low');
     assert.equal(effort(sidePayload), scenario.thinking);

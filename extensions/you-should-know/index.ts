@@ -58,8 +58,17 @@ const CHILD_NAME = process.env.PI_SUBAGENT_NAME?.trim() || process.env.PI_SUBAGE
 const PREAMBLE = DETECT_TEMPLATE.slice(0, DETECT_TEMPLATE.indexOf("</system-reminder>") + "</system-reminder>".length);
 
 const list = (xs: string[]) => (xs.length > 0 ? xs.map((x) => `- ${x}`).join("\n") : "(nothing yet)"); // ft()
-const detectPrompt = (seen: string[], known: string[]) =>
-	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)); // dn()
+type NoteLanguage = "zh" | "en";
+const PROTOCOL_LANGUAGE_RULE =
+	"The labels learn:, tag:, evidence:, explain:, the tag values, and the sentinels learn: none / evidence: none stay exactly as written — never translated.";
+const languageContract = (language?: NoteLanguage) =>
+	language === "zh"
+		? `Write the learn line and the explain text in Simplified Chinese. ${PROTOCOL_LANGUAGE_RULE}`
+		: language === "en"
+			? `Write the learn line and the explain text in English. ${PROTOCOL_LANGUAGE_RULE}`
+			: `Write the learn line and the explain text in the language the user is using in this conversation. If they asked for a specific language, use that. If there is no clear language signal, write in English. ${PROTOCOL_LANGUAGE_RULE}`;
+const detectPrompt = (seen: string[], known: string[], language?: NoteLanguage) =>
+	DETECT_TEMPLATE.replace("{{SEEN}}", list(seen)).replace("{{KNOWN}}", list(known)).replace("{{LANGUAGE_CONTRACT}}", languageContract(language)); // dn()
 
 type Direction = "first" | "simpler_words" | "less_detail" | "more_detail";
 const DIRECTION_ASK: Record<Exclude<Direction, "first">, string> = {
@@ -80,11 +89,12 @@ const shape = (rule: string) =>
 	"Write for someone smart who knows nothing about this code and is context-switching constantly: assume they remember no term and no detail from earlier. One idea only. " +
 	rule +
 	'\nShape:\n1. A title line: `**` two to six plain words that state the point `**`.\n2. First sentence: what the thing IS, in everyday words, with a tiny example of what it does or produces (e.g. "a health check is a step that asks each server one question on a timer and saves the answer, like "are you still up? yes/no""). Never open with a name they have not used; never assume they know what it is.\n3. Then the before/after or the two options as two short lines, using their own numbers and names ("list it once at the top \u2192 asked 1\u00d7 \u2026 inside each job \u2192 asked 3\u00d7"). If, and only if, a small ASCII sketch shows this better than two lines of text, put one in a ``` fenced block, at most 60 characters wide and 6 lines tall; otherwise no sketch.\n4. Then the concrete consequence in their terms (a count, a cost, a wrong number they would have reported) and, last, the choice they are making, in one sentence.\nNo analogy unless it is genuinely clearer than the example, and never both. Any code name appears only after its everyday description, in backticks. Never coin a term or nickname. No headings other than the title, no bullets, no "in summary". Short words, short sentences.'; // pn()
-const explainPrompt = (line: string, prev?: { direction: Exclude<Direction, "first">; text: string }) =>
+const explainPrompt = (line: string, prev?: { direction: Exclude<Direction, "first">; text: string }, language?: NoteLanguage) =>
 	`${PREAMBLE}\nAnswer straight away: do not think it over first, do not call any tool.\nThe person watching you work said yes to: "${line}"\n` +
 	(prev ? `You already showed them this, and they asked for it ${DIRECTION_ASK[prev.direction]}:\n${prev.text}\nDo not repeat it; rewrite it.\n` : "") +
 	shape(DIRECTION_RULE[prev?.direction ?? "first"]) +
-	"\nOutput only the explanation."; // mn()
+	"\nOutput only the explanation.\n" +
+	languageContract(language); // mn()
 
 // ---- persistent state (across sessions, like CC's plugin store) ----
 type State = { enabled: boolean; seen: string[]; known: string[]; ignoredInARow: number; skip: number };
@@ -152,7 +162,24 @@ function parse(text: string): Parsed {
 	}
 	return { kind: "line", line, tag, evidence, explanation };
 }
-const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); // Co()
+const norm = (s: string) => {
+	const n = s.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}\p{M}]+/gu, " ").trim();
+	return /[\p{L}\p{N}]/u.test(n) ? n : "";
+};
+const CJK = /\p{Script=Han}/u;
+const textMatchesLanguage = (text: string, language: NoteLanguage) =>
+	language === "zh" ? CJK.test(text) : !CJK.test(text);
+const noteLanguageOk = (line: string, explanation: string | undefined, language: NoteLanguage) =>
+	textMatchesLanguage(line, language) && (!explanation || textMatchesLanguage(explanation, language));
+function readConfig(): Record<string, unknown> {
+	return existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
+}
+function configuredLanguage(config: Record<string, unknown> = readConfig()): NoteLanguage | undefined {
+	if (!Object.hasOwn(config, "language")) return undefined;
+	const value = config.language;
+	if (value === "zh" || value === "en") return value;
+	throw new Error("YSK language must be zh or en");
+}
 
 const textOf = (msg: { content: unknown }) =>
 	Array.isArray(msg.content)
@@ -185,7 +212,7 @@ export default function (pi: ExtensionAPI) {
 	const pickModel = (ctx: ExtensionContext) => {
 		const id = ctx.model?.id.split("/").at(-1) ?? "";
 		const family = /^gpt-/i.test(id) ? "gpt" : /^claude-fable(?:-|$)/i.test(id) ? "fable" : undefined;
-		const config = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, "utf8")) : {};
+		const config = readConfig();
 		const route = family ? { ...defaultRoutes[family], ...config[family] } : undefined;
 		const override = process.env.YSK_MODEL?.trim();
 		if (!override && !route) return { model: ctx.model, thinking: undefined };
@@ -332,6 +359,42 @@ export default function (pi: ExtensionAPI) {
 		if (payload) forkPayloads.add(payload);
 		return payload;
 	};
+	const repairPrompt = (raw: string, language: NoteLanguage) => {
+		const target = language === "zh" ? "Simplified Chinese" : "English";
+		return `Rewrite the following You Should Know note so the learn line and the explain text are in ${target}.\nKeep technical terms, code names, issue numbers, and file paths unchanged.\n${PROTOCOL_LANGUAGE_RULE}\nOutput only the rewritten note in the same labeled format.\n\n${raw}`;
+	};
+	const repairExplanationPrompt = (text: string, language: NoteLanguage) => {
+		const target = language === "zh" ? "Simplified Chinese" : "English";
+		return `Rewrite the following explanation in ${target}.\nKeep technical terms, code names, issue numbers, and file paths unchanged.\nOutput only the rewritten explanation.\n\n${text}`;
+	};
+	async function sideRequest(ctx: ExtensionContext, prompt: string, signal: AbortSignal) {
+		const { model, thinking } = pickModel(ctx);
+		if (!model) throw new Error("no model");
+		const messages = [{ role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() }];
+		const options = {
+			signal, sessionId: ctx.sessionManager.getSessionId(),
+			onPayload: (p: unknown) => {
+				if (p && typeof p === "object") forkPayloads.add(p as object);
+				return undefined;
+			},
+		};
+		const context = { messages, systemPrompt: "One short rewrite. Do not call tools." } as any;
+		const t0 = Date.now();
+		const res = thinking === undefined && model.api === "anthropic-messages"
+			? await ctx.modelRegistry.complete(model, context, options)
+			: await ctx.modelRegistry.streamSimple(model, context, { ...options, reasoning: thinking, toolChoice: "none" }).result();
+		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, ms: Date.now() - t0 };
+	}
+	async function localizeExplanation(ctx: ExtensionContext, text: string, language: NoteLanguage | undefined, signal: AbortSignal) {
+		if (!language || textMatchesLanguage(text, language)) return { text };
+		if (DEBUG) ctx.ui.notify("you-should-know: repairing language", "info");
+		const repaired = await sideRequest(ctx, repairExplanationPrompt(text, language), signal);
+		if (!repaired.text || !textMatchesLanguage(repaired.text, language)) {
+			if (DEBUG) ctx.ui.notify("you-should-know: language_rejected explanation", "info");
+			throw new Error("language_rejected");
+		}
+		return { text: repaired.text, repair: repaired };
+	}
 	const unmark = (m: any) =>
 		Array.isArray(m?.content) ? { ...m, content: m.content.map(({ cache_control: _drop, ...b }: any) => b) } : m;
 	const sameMsg = (a: any, b: any) => JSON.stringify(unmark(a)) === JSON.stringify(unmark(b));
@@ -489,15 +552,29 @@ export default function (pi: ExtensionAPI) {
 			let outcome = "error";
 			let extra: Record<string, unknown> = {};
 			try {
-				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known), ac.signal);
+				const language = configuredLanguage();
+				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known, language), ac.signal);
 				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking };
 				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
 				else if (r.stopReason === "error") outcome = "error";
 				else if (!r.text) outcome = "empty";
 				else {
-					const p = parse(r.text);
-					if (p.kind !== "line") outcome = p.kind;
-					else if ([...seen, ...known].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
+					let p = parse(r.text);
+					if (p.kind === "line" && language && !noteLanguageOk(p.line, p.explanation, language)) {
+						if (DEBUG) ctx.ui.notify("you-should-know: repairing language", "info");
+						const repaired = await sideRequest(ctx, repairPrompt(r.text, language), ac.signal);
+						extra.repair = { usage: repaired.usage, ms: repaired.ms, stopReason: repaired.stopReason, error: repaired.error };
+						const next = parse(repaired.text);
+						if (next.kind !== "line" || !noteLanguageOk(next.line, next.explanation, language)) {
+							outcome = "language_rejected";
+							extra.line = p.line;
+							if (DEBUG) ctx.ui.notify(`you-should-know: language_rejected ${p.line}`, "info");
+							p = { kind: "parse_failed" };
+						} else p = next;
+					}
+					if (outcome === "language_rejected") { /* discarded */ }
+					else if (p.kind !== "line") outcome = p.kind;
+					else if (norm(p.line) && [...seen, ...known].some((x) => norm(x) === norm(p.line))) outcome = "deduped";
 					else if (promptCounter !== askedAt) outcome = "stale";
 					else {
 						outcome = "shown";
@@ -510,8 +587,17 @@ export default function (pi: ExtensionAPI) {
 							let explanation = p.explanation;
 							if (!explanation) {
 								try {
-									explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
+									explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line, undefined, language), ac.signal)).text || undefined;
 								} catch {}
+							}
+							if (explanation) {
+								try {
+									const localized = await localizeExplanation(ctx, explanation, language, ac.signal);
+									explanation = localized.text;
+									if (localized.repair) extra.repairExplanation = { usage: localized.repair.usage, ms: localized.repair.ms };
+								} catch {
+									explanation = undefined;
+								}
 							}
 							relayToParent({ line: p.line, tag: p.tag, evidence: p.evidence, explanation, from: CHILD_NAME });
 							outcome = "relayed";
@@ -521,8 +607,18 @@ export default function (pi: ExtensionAPI) {
 						if (ctx.mode !== "tui" && !note.explanation) {
 							// The client's "Explain" has nothing to ask, so write the explanation now.
 							try {
-								note.explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
+								note.explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line, undefined, language), ac.signal)).text || undefined;
 							} catch {}
+						}
+						if (note.explanation) {
+							try {
+								const localized = await localizeExplanation(ctx, note.explanation, language, ac.signal);
+								note.explanation = localized.text;
+								if (localized.repair) extra.repairExplanation = { usage: localized.repair.usage, ms: localized.repair.ms };
+							} catch (err) {
+								note.explanation = undefined;
+								if (ctx.mode !== "tui") ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error");
+							}
 						}
 						notes.push(note);
 						while (ctx.mode === "tui" && notes.length > MAX_NOTES) log({ event: "overflow_dropped", line: notes.shift()!.line });
@@ -543,9 +639,11 @@ export default function (pi: ExtensionAPI) {
 
 	async function showExplanation(ctx: ExtensionContext, n: Note) {
 		let text = n.explanation;
+		const language = configuredLanguage();
 		if (!text) {
 			ctx.ui.notify("One moment\u2026", "info");
-			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
+			const generated = (await fork(ctx, lastLlmMessages, explainPrompt(n.line, undefined, language), new AbortController().signal)).text;
+			text = (await localizeExplanation(ctx, generated, language, new AbortController().signal)).text;
 		}
 		while (true) {
 			const choice = ctx.mode !== "tui" ? await explainBySelect(ctx, n, text!) : await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
@@ -574,10 +672,10 @@ export default function (pi: ExtensionAPI) {
 					const r = await fork(
 						ctx,
 						lastLlmMessages,
-						explainPrompt(n.line, { direction: choice, text: text! }),
+						explainPrompt(n.line, { direction: choice, text: text! }, language),
 						new AbortController().signal,
 					);
-					if (r.text) text = r.text;
+					if (r.text) text = (await localizeExplanation(ctx, r.text, language, new AbortController().signal)).text;
 				} catch (err) {
 					ctx.ui.notify(`Couldn\u2019t write that explanation: ${err}`, "error");
 				}
@@ -633,6 +731,23 @@ export default function (pi: ExtensionAPI) {
 				`You should know: ${state.enabled ? "on" : "off"} \u00b7 ${checks} checks this session \u00b7 skip ${state.skip} \u00b7 model ${model?.provider ?? "?"}/${model?.id ?? "?"} \u00b7 thinking ${thinking ?? "main request"} \u00b7 config ${CONFIG_FILE} \u00b7 log ${LOG_FILE}`,
 				"info",
 			);
+			return;
+		}
+		if (arg === "clear" && ctx.mode === "tui") {
+			if (notes.length === 0) {
+				ctx.ui.notify("No notes to dismiss.", "info");
+				return;
+			}
+			const dismissed = notes.slice();
+			notes = [];
+			for (const n of dismissed) {
+				log({ event: "answer", answer: "dismiss", via: "clear", line: n.line, msToAnswer: Date.now() - n.shownAt });
+			}
+			state.ignoredInARow = 0;
+			state.skip = 0;
+			saveState(state);
+			render(ctx);
+			ctx.ui.notify(`Dismissed ${dismissed.length} notes.`, "info");
 			return;
 		}
 		if (notes.length === 0) {
@@ -705,7 +820,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("ysk", {
-		description: "You should know: respond to the current note (/ysk on|off|status|test)",
+		description: "You should know: respond to the current note (/ysk on|off|status|test|clear)",
 		handler: async (args, ctx) => respond(ctx, args?.trim() || undefined),
 	});
 	pi.registerShortcut("alt+shift+y", { description: "You should know: respond to the current note", handler: (ctx) => respond(ctx) });
