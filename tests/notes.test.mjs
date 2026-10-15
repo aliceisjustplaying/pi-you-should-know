@@ -10,25 +10,37 @@ after(() => rmSync(home, { recursive: true, force: true }));
 const data = (source) => `data:text/javascript,${encodeURIComponent(source)}`;
 registerHooks({ resolve(specifier, context, next) {
   if (specifier === 'node:os') return { url: data(`export const homedir = () => ${JSON.stringify(home)}`), shortCircuit: true };
-  if (specifier === '@earendil-works/pi-coding-agent') return { url: data('export class DynamicBorder {}; export const getMarkdownTheme = () => ({})'), shortCircuit: true };
+  if (specifier === '@earendil-works/pi-coding-agent') return { url: data('export class DynamicBorder {}; export const getMarkdownTheme = () => ({}); export const convertToLlm = (messages) => messages'), shortCircuit: true };
   if (specifier === '@earendil-works/pi-tui') return { url: data('export class Container {}; export class Markdown {}; export class Text {}; export const matchesKey = () => false'), shortCircuit: true };
   return next(specifier, context);
 }});
+delete process.env.PI_CODING_AGENT_DIR;
 const { default: extension } = await import(process.env.YSK_TEST_SOURCE ?? '../extensions/you-should-know/index.ts');
 function open(session, sessionDir = home) {
   const handlers = new Map();
+  const registered = [];
   const notices = [];
   let command;
-  extension({ on: (event, handler) => handlers.set(event, handler), registerCommand: (_, value) => { command = value.handler; }, registerShortcut() {} });
+  extension({ on: (event, handler) => { registered.push(event); handlers.set(event, handler); }, registerCommand: (_, value) => { command = value.handler; }, registerShortcut() {} });
   const ctx = {
     mode: 'rpc', hasUI: false, isIdle: () => false,
-    sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => session },
+    sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => session, buildSessionProjection: () => ({ messages: [] }) },
     ui: { notify: (message) => notices.push(message) },
   };
   handlers.get('session_start')({}, ctx);
-  return { notices, command: (text) => command(text, ctx), input: (text) => handlers.get('input')({ source: 'rpc', text }, ctx), close: () => handlers.get('session_shutdown')({}, ctx) };
+  return { registered, notices, command: (text) => command(text, ctx), input: (text) => handlers.get('input')({ source: 'rpc', text }, ctx), turnStart: (turnIndex) => handlers.get('turn_start')({ turnIndex }, ctx), close: () => handlers.get('session_shutdown')({}, ctx) };
 }
 const state = () => { const file = join(home, '.pi/agent/you-should-know/state.json'); return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : { known: [], ignoredInARow: 0, skip: 0 }; };
+
+test('registers no boundary events: any boundary handler (turn_end, agent_before_settle) makes Pi rebuild agent.state.messages each turn and defeats cacheWarming "idle" (pi#10956)', () => {
+  const client = open('boundary-events');
+  try {
+    assert.ok(client.registered.includes('turn_start'), 'detection must stay scheduled via turn_start');
+    for (const boundary of ['turn_end', 'agent_before_settle']) {
+      assert.equal(client.registered.includes(boundary), false, `must not register boundary event ${boundary}`);
+    }
+  } finally { client.close(); }
+});
 
 test('RPC prompts count ignored notes and back off, but ysk commands do not', async () => {
   const client = open('backoff');

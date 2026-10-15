@@ -1,9 +1,17 @@
 // You Should Know: a port of Claude Code's built-in `cc-plugin-you-should-know` mod (v2.1.287).
 //
-// Every 6th turn of an agent run, fork the live conversation via turn_end's
-// `context.llmMessages`, select a side model, append the detect prompt and ask whether
-// there's something the user should know but probably missed. Most of the time the answer is
-// `learn: none`. When it isn't, show a note above the editor. Respond with /ysk (or alt+shift+y).
+// Every 6th turn of an agent run, fork the live conversation, select a side model, append
+// the detect prompt and ask whether there's something the user should know but probably
+// missed. Most of the time the answer is `learn: none`. When it isn't, show a note above the
+// editor. Respond with /ysk (or alt+shift+y).
+//
+// The check fires on turn_start and never on a boundary event ("turn_end",
+// "agent_before_settle"): merely registering a boundary handler makes Pi rebuild
+// agent.state.messages after every turn, and the rebuilt message objects fail
+// cacheWarming: "idle" identity comparison, silently ending the idle cache keep-alive
+// (earendil-works/pi#10956, zj1123581321/pi-you-should-know#4). The conversation snapshot is
+// built on demand instead via convertToLlm(ctx.sessionManager.buildSessionProjection().messages)
+// — the same projection the core itself converts for boundary contexts.
 //
 // Reference (extracted from the Claude Code binary): ~/.pi/agent/reference/you-should-know/
 //
@@ -17,7 +25,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 
 // ---- constants copied from the CC mod ----
@@ -266,7 +274,14 @@ export default function (pi: ExtensionAPI) {
 		return { text: textOf(res), usage: res.usage, stopReason: res.stopReason, error: res.errorMessage, provider: model.provider, model: model.id, thinking };
 	}
 
-	let lastLlmMessages: any[] = [];
+	/**
+	 * Conversation snapshot for fork prompts, built on demand from the session
+	 * projection — exactly what the core itself feeds through convertToLlm for
+	 * boundary contexts. Never taken from turn_end's context.llmMessages; see the
+	 * header note on boundary events and pi#10956.
+	 */
+	const snapshotLlmMessages = (ctx: ExtensionContext) =>
+		convertToLlm(ctx.sessionManager.buildSessionProjection().messages) as any[];
 
 	/**
 	 * The main conversation's last request, exactly as sent. The fork is only
@@ -465,8 +480,10 @@ export default function (pi: ExtensionAPI) {
 		saveState(state);
 	});
 
-	pi.on("turn_end", (e, ctx) => {
-		lastLlmMessages = e.context.llmMessages as any[];
+	// turn_start(turnIndex) means turnIndex turns have fully persisted into the session
+	// manager, so the snapshot below sees every completed turn. It is a plain extension
+	// event, not a boundary: emitting it never rebuilds agent.state.messages (pi#10956).
+	pi.on("turn_start", (e, ctx) => {
 		if (!state.enabled || !ctx.hasUI) return;
 		const step = e.turnIndex;
 		if (!(step > 0 && step % CHECK_EVERY_STEPS === 0)) return;
@@ -489,7 +506,7 @@ export default function (pi: ExtensionAPI) {
 			let outcome = "error";
 			let extra: Record<string, unknown> = {};
 			try {
-				const r = await fork(ctx, lastLlmMessages, detectPrompt(seen, known), ac.signal);
+				const r = await fork(ctx, snapshotLlmMessages(ctx), detectPrompt(seen, known), ac.signal);
 				extra = { usage: r.usage, stopReason: r.stopReason, error: r.error, provider: r.provider, model: r.model, thinking: r.thinking };
 				if (ac.signal.aborted || r.stopReason === "aborted") outcome = "aborted";
 				else if (r.stopReason === "error") outcome = "error";
@@ -510,7 +527,7 @@ export default function (pi: ExtensionAPI) {
 							let explanation = p.explanation;
 							if (!explanation) {
 								try {
-									explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
+									explanation = (await fork(ctx, snapshotLlmMessages(ctx), explainPrompt(p.line), ac.signal)).text || undefined;
 								} catch {}
 							}
 							relayToParent({ line: p.line, tag: p.tag, evidence: p.evidence, explanation, from: CHILD_NAME });
@@ -521,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 						if (ctx.mode !== "tui" && !note.explanation) {
 							// The client's "Explain" has nothing to ask, so write the explanation now.
 							try {
-								note.explanation = (await fork(ctx, lastLlmMessages, explainPrompt(p.line), ac.signal)).text || undefined;
+								note.explanation = (await fork(ctx, snapshotLlmMessages(ctx), explainPrompt(p.line), ac.signal)).text || undefined;
 							} catch {}
 						}
 						notes.push(note);
@@ -545,7 +562,7 @@ export default function (pi: ExtensionAPI) {
 		let text = n.explanation;
 		if (!text) {
 			ctx.ui.notify("One moment\u2026", "info");
-			text = (await fork(ctx, lastLlmMessages, explainPrompt(n.line), new AbortController().signal)).text;
+			text = (await fork(ctx, snapshotLlmMessages(ctx), explainPrompt(n.line), new AbortController().signal)).text;
 		}
 		while (true) {
 			const choice = ctx.mode !== "tui" ? await explainBySelect(ctx, n, text!) : await ctx.ui.custom<string>((_tui, theme, _kb, done) => {
@@ -573,7 +590,7 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const r = await fork(
 						ctx,
-						lastLlmMessages,
+						snapshotLlmMessages(ctx),
 						explainPrompt(n.line, { direction: choice, text: text! }),
 						new AbortController().signal,
 					);

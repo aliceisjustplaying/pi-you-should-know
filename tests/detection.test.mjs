@@ -9,7 +9,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // This is a local protocol fixture, not a model: seven real read-tool steps make Pi
-// fire turn_end, and the side response is held until Pi reports agent_settled.
+// fire turn_start with turnIndex 6 as the seventh turn begins (the extension checks on
+// turn_start, never on boundary events — see pi#10956), and the side response is held
+// until Pi reports agent_settled.
 for (const layout of ['parent', 'flat-child', 'nested-child']) {
   test(`real detection survives idle completion: ${layout}`, { timeout: 20_000 }, async () => {
     const root = mkdtempSync(join(tmpdir(), 'ysk-detection-'));
